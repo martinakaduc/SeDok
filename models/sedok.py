@@ -2,6 +2,7 @@ import logging
 import math
 import os
 from datetime import datetime
+from turtle import forward
 
 import dgl
 import torch
@@ -83,19 +84,6 @@ def apply_norm(g, h, norm_type, norm_layer):
     return norm_layer(h)
 
 
-class CoordsNorm(nn.Module):
-    def __init__(self, eps=1e-8, scale_init=1.):
-        super().__init__()
-        self.eps = eps
-        scale = torch.zeros(1).fill_(scale_init)
-        self.scale = nn.Parameter(scale)
-
-    def forward(self, coords):
-        norm = coords.norm(dim=-1, keepdim=True)
-        normed_coords = coords / norm.clamp(min=self.eps)
-        return normed_coords * self.scale
-
-
 def cross_attention(queries, keys, values, mask, cross_msgs):
     """Compute cross attention.
     x_i attend to y_j:
@@ -130,7 +118,20 @@ def get_mask(ligand_batch_num_nodes, receptor_batch_num_nodes, device):
     return mask
 
 
-class IEGMN_Layer(nn.Module):
+class CoordsNorm(nn.Module):
+    def __init__(self, eps=1e-8, scale_init=1.):
+        super().__init__()
+        self.eps = eps
+        scale = torch.zeros(1).fill_(scale_init)
+        self.scale = nn.Parameter(scale)
+
+    def forward(self, coords):
+        norm = coords.norm(dim=-1, keepdim=True)
+        normed_coords = coords / norm.clamp(min=self.eps)
+        return normed_coords * self.scale
+
+# =================================================================================================================
+class ISET_Layer(nn.Module):
     def __init__(
             self,
             orig_h_feats_dim,
@@ -166,7 +167,7 @@ class IEGMN_Layer(nn.Module):
         geometry_reg_step_size=0.1
     ):
 
-        super(IEGMN_Layer, self).__init__()
+        super(ISET_Layer, self).__init__()
 
         self.fine_tune = fine_tune
         self.cross_msgs = cross_msgs
@@ -377,6 +378,25 @@ class IEGMN_Layer(nn.Module):
                 nn.Linear(h_feats_dim, 1),
             )
 
+        # Rotation matrix & translation vector
+        self.W_feature = nn.Linear(out_feats_dim, out_feats_dim, bias=False)
+        self.R_linear = nn.Linear(3, 3, bias=False)
+        self.R_norm = get_norm("LN", 3)
+
+        self.t_linear = nn.Linear(3, 3, bias=False)
+
+        self.h_mean_lig = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim),
+            nn.Dropout(dropout),
+            get_non_lin(nonlin, leakyrelu_neg_slope),
+        )
+
+        self.keypts_attention_rec = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_queries_rec = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
     def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -416,13 +436,6 @@ class IEGMN_Layer(nn.Module):
         edge_coef_rec = self.coords_mlp_rec(edges.data['msg'])  # \phi^x(m_{i->j})
         x_rel = self.rec_coords_norm(edges.data['x_rel']) if self.normalize_coordinate_update else edges.data['x_rel']
         return {'m': x_rel * edge_coef_rec}  # (x_i - x_j) * \phi^x(m_{i->j})
-
-    def attention_coefficients(self, edges):  # for when using cross edges (but this is super slow so dont do it)
-        return {'attention_coefficient': torch.sum(edges.dst['q'] * edges.src['k'], dim=1), 'values': edges.src['v']}
-
-    def attention_aggregation(self, nodes):  # for when using cross edges (but this is super slow so dont do it)
-        attention = torch.softmax(nodes.mailbox['attention_coefficient'], dim=1)
-        return {'cross_attention_feat': torch.sum(attention[:, :, None] * nodes.mailbox['values'], dim=1)}
 
     def forward(self, lig_graph, rec_graph, coords_lig, h_feats_lig, original_ligand_node_features, orig_coords_lig,
                 coords_rec, h_feats_rec, original_receptor_node_features, orig_coords_rec, mask, geometry_graph):
@@ -485,51 +498,8 @@ class IEGMN_Layer(nn.Module):
             lig_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
             rec_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
 
-            if self.fine_tune:
-                x_evolved_lig = x_evolved_lig + self.att_mlp_cross_coors_V_lig(h_feats_lig) * (
-                        self.lig_cross_coords_norm(lig_graph.ndata['x_now'] - cross_attention(self.att_mlp_cross_coors_Q_lig(h_feats_lig),
-                                                                   self.att_mlp_cross_coors_K(h_feats_rec),
-                                                                   rec_graph.ndata['x_now'], mask, self.cross_msgs)))
-            if self.fine_tune:
-                x_evolved_rec = x_evolved_rec + self.att_mlp_cross_coors_V(h_feats_rec) * (
-                        self.rec_cross_coords_norm(rec_graph.ndata['x_now'] - cross_attention(self.att_mlp_cross_coors_Q(h_feats_rec),
-                                                                   self.att_mlp_cross_coors_K_lig(h_feats_lig),
-                                                                   lig_graph.ndata['x_now'], mask.transpose(0, 1),
-                                                                   self.cross_msgs)))
-            trajectory = []
-            if self.save_trajectories: trajectory.append(x_evolved_lig.detach().cpu())
-            if self.loss_geometry_regularization:
-                src, dst = geometry_graph.edges()
-                src = src.long()
-                dst = dst.long()
-                d_squared = torch.sum((x_evolved_lig[src] - x_evolved_lig[dst]) ** 2, dim=1)
-                geom_loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2) ** 2)
-            else:
-                geom_loss = 0
-            if self.geometry_regularization:
-                src, dst = geometry_graph.edges()
-                src = src.long()
-                dst = dst.long()
-                for step in range(self.geom_reg_steps): # T
-                    d_squared = torch.sum((x_evolved_lig[src] - x_evolved_lig[dst]) ** 2, dim=1) # d_z
-                    Loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2)**2) # this is the loss whose gradient we are calculating here
-                    grad_d_squared = 2 * (x_evolved_lig[src] - x_evolved_lig[dst])
-                    geometry_graph.edata['partial_grads'] = 2 * (d_squared - geometry_graph.edata['feat'] ** 2)[:,None] * grad_d_squared
-                    geometry_graph.update_all(fn.copy_edge('partial_grads', 'partial_grads_msg'),
-                                              fn.sum('partial_grads_msg', 'grad_x_evolved'))
-                    grad_x_evolved = geometry_graph.ndata['grad_x_evolved']
-                    x_evolved_lig = x_evolved_lig + self.geometry_reg_step_size * grad_x_evolved
-                    if self.save_trajectories:
-                        trajectory.append(x_evolved_lig.detach().cpu())
-
-
-
             if self.debug:
-                log(torch.max(lig_graph.ndata['aggr_msg'].abs()), 'data[aggr_msg]: \sum_j m_{i->j} ')
-                if self.lig_evolve:
-                    log(torch.max(lig_graph.ndata['x_update'].abs()),
-                        'data[x_update] : \sum_j (x_i - x_j) * \phi^x(m_{i->j})')
-                    log(torch.max(x_evolved_lig.abs()), 'x_i new = x_evolved_lig : x_i + data[x_update]')
+                log(torch.max(lig_graph.ndata['aggr_msg'].abs()), 'data[aggr_msg]: \sum_j m_{i->j}')
 
             input_node_upd_ligand = torch.cat((self.node_norm(lig_graph.ndata['feat']),
                                                lig_graph.ndata['aggr_msg'],
@@ -563,29 +533,94 @@ class IEGMN_Layer(nn.Module):
                                          self.final_h_layernorm_layer_lig)
             node_upd_receptor = apply_norm(rec_graph, node_upd_receptor,
                                            self.final_h_layer_norm, self.final_h_layernorm_layer)
-            return x_evolved_lig, node_upd_ligand, x_evolved_rec, node_upd_receptor, trajectory, geom_loss
+
+            rotation_matrices = []
+            translation_vectors = []
+            list_x_evolved_lig = []
+
+            # Seperate each ligand and protein
+            ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
+            ligs_node_idx.insert(0, 0)
+            recs_node_idx = torch.cumsum(rec_graph.batch_num_nodes(), dim=0).tolist()
+            recs_node_idx.insert(0, 0)
+
+            for idx in range(len(ligs_node_idx) - 1):
+                lig_start = ligs_node_idx[idx]
+                lig_end = ligs_node_idx[idx + 1]
+                rec_start = recs_node_idx[idx]
+                rec_end = recs_node_idx[idx + 1]
+
+                node_upd_per_ligand = node_upd_ligand[lig_start:lig_end]
+                node_upd_per_receptor = node_upd_receptor[rec_start:rec_end]
+                x_evolved_per_lig = x_evolved_lig[lig_start:lig_end]
+                x_evolved_per_rec = x_evolved_rec[rec_start:rec_end]
+
+
+                rotation_matrix = self.W_feature(node_upd_per_receptor) @ node_upd_per_ligand.T + \
+                                (self.W_feature(node_upd_per_ligand) @ node_upd_per_receptor.T).T
+
+                rotation_matrix = self.R_linear(x_evolved_per_rec.T @ rotation_matrix @ x_evolved_per_lig)
+                rotation_matrix = apply_norm(None, rotation_matrix, "LN", self.R_norm)
+                    
+                x_evolved_per_lig = (rotation_matrix @ x_evolved_per_lig.T).T
+
+                d = node_upd_per_ligand.shape[1]
+
+                lig_feats_mean = torch.mean(self.h_mean_lig(node_upd_per_ligand), dim=0, keepdim=True)  # (1, d)
+
+                att_weights_rec = (self.keypts_attention_rec(node_upd_per_receptor).view(-1, 1, d).transpose(0, 1) @
+                                self.keypts_queries_rec(lig_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
+                                math.sqrt(d)).view(1, -1)
+
+                translation_vector = self.t_linear(att_weights_rec @ x_evolved_per_rec - torch.mean(x_evolved_per_lig))
+
+                list_x_evolved_lig.append(x_evolved_per_lig + translation_vector)
+
+                rotation_matrices.append(rotation_matrix)
+                translation_vectors.append(translation_vector)
+
+                if self.debug:
+                    log('rotation', rotation_matrix)
+                    log('rotation @ rotation.t() - eye(3)', rotation_matrix @ rotation_matrix.T - torch.eye(3).to(self.device))
+                    log('translation', translation_vector)
+                    log(torch.max(x_evolved_per_lig.abs()), 'x_i new')
+
+            # log(list_x_evolved_lig[0].shape)
+            new_x_evolved_lig = torch.cat(list_x_evolved_lig, 0)
+            trajectory = []
+            if self.save_trajectories:
+                trajectory.append(new_x_evolved_lig.detach().cpu())
+            
+            if self.loss_geometry_regularization:
+                src, dst = geometry_graph.edges()
+                src = src.long()
+                dst = dst.long()
+                d_squared = torch.sum((new_x_evolved_lig[src] - new_x_evolved_lig[dst]) ** 2, dim=1)
+                geom_loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2) ** 2)
+            else:
+                geom_loss = 0
+
+        return new_x_evolved_lig, node_upd_ligand, x_evolved_rec, node_upd_receptor, trajectory, geom_loss, rotation_matrices, translation_vectors
 
     def __repr__(self):
-        return "IEGMN Layer " + str(self.__dict__)
-
+        return "ISET Layer " + str(self.__dict__)
 
 # =================================================================================================================
-class IEGMN(nn.Module):
-
+class ISET(nn.Module):
     def __init__(self, n_lays, debug, device, use_rec_atoms, shared_layers, noise_decay_rate, cross_msgs, noise_initial,
                  use_edge_features_in_gmn, use_mean_node_features, residue_emb_dim, lay_hid_dim, num_att_heads,
                  dropout, nonlin, leakyrelu_neg_slope, random_vec_dim=0, random_vec_std=1, use_scalar_features=True,
                  num_lig_feats=None, move_keypts_back=False, normalize_Z_lig_directions=False,
-                 unnormalized_kpt_weights=False, centroid_keypts_construction_rec=False,
+                 unnormalized_rotation_weights=False, centroid_keypts_construction_rec=False,
                  centroid_keypts_construction_lig=False, rec_no_softmax=False, lig_no_softmax=False,
                  normalize_Z_rec_directions=False,
                  centroid_keypts_construction=False, evolve_only=False, separate_lig=False, save_trajectories=False, **kwargs):
-        super(IEGMN, self).__init__()
+        super(ISET, self).__init__()
         self.debug = debug
         self.cross_msgs = cross_msgs
         self.device = device
         self.save_trajectories = save_trajectories
-        self.unnormalized_kpt_weights = unnormalized_kpt_weights
+        self.unnormalized_rotation_weights = unnormalized_rotation_weights
         self.separate_lig =separate_lig
         self.use_rec_atoms = use_rec_atoms
         self.noise_decay_rate = noise_decay_rate
@@ -621,9 +656,9 @@ class IEGMN(nn.Module):
         input_node_feats_dim = residue_emb_dim
         if self.use_mean_node_features:
             input_node_feats_dim += 5  ### Additional features from mu_r_norm
-        self.iegmn_layers = nn.ModuleList()
-        self.iegmn_layers.append(
-            IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+        self.iset_layers = nn.ModuleList()
+        self.iset_layers.append(
+            ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                         h_feats_dim=input_node_feats_dim,
                         out_feats_dim=lay_hid_dim,
                         nonlin=nonlin,
@@ -635,7 +670,7 @@ class IEGMN(nn.Module):
                         save_trajectories=save_trajectories,**kwargs))
 
         if shared_layers:
-            interm_lay = IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+            interm_lay = ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                                      h_feats_dim=lay_hid_dim,
                                      out_feats_dim=lay_hid_dim,
                                      cross_msgs=self.cross_msgs,
@@ -646,12 +681,12 @@ class IEGMN(nn.Module):
                                      dropout=dropout,
                                      save_trajectories=save_trajectories,**kwargs)
             for layer_idx in range(1, n_lays):
-                self.iegmn_layers.append(interm_lay)
+                self.iset_layers.append(interm_lay)
         else:
             for layer_idx in range(1, n_lays):
                 debug_this_layer = debug if n_lays - 1 == layer_idx else False
-                self.iegmn_layers.append(
-                    IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+                self.iset_layers.append(
+                    ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                                 h_feats_dim=lay_hid_dim,
                                 out_feats_dim=lay_hid_dim,
                                 cross_msgs=self.cross_msgs,
@@ -662,9 +697,9 @@ class IEGMN(nn.Module):
                                 dropout=dropout,
                                 save_trajectories=save_trajectories,**kwargs))
         if self.separate_lig:
-            self.iegmn_layers_separate = nn.ModuleList()
-            self.iegmn_layers_separate.append(
-                IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+            self.iset_layers_separate = nn.ModuleList()
+            self.iset_layers_separate.append(
+                ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                             h_feats_dim=input_node_feats_dim,
                             out_feats_dim=lay_hid_dim,
                             nonlin=nonlin,
@@ -676,7 +711,7 @@ class IEGMN(nn.Module):
                             save_trajectories=save_trajectories,**kwargs))
 
             if shared_layers:
-                interm_lay = IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+                interm_lay = ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                                          h_feats_dim=lay_hid_dim,
                                          out_feats_dim=lay_hid_dim,
                                          cross_msgs=self.cross_msgs,
@@ -687,12 +722,12 @@ class IEGMN(nn.Module):
                                          dropout=dropout,
                                          save_trajectories=save_trajectories,**kwargs)
                 for layer_idx in range(1, n_lays):
-                    self.iegmn_layers_separate.append(interm_lay)
+                    self.iset_layers_separate.append(interm_lay)
             else:
                 for layer_idx in range(1, n_lays):
                     debug_this_layer = debug if n_lays - 1 == layer_idx else False
-                    self.iegmn_layers_separate.append(
-                        IEGMN_Layer(orig_h_feats_dim=input_node_feats_dim,
+                    self.iset_layers_separate.append(
+                        ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
                                     h_feats_dim=lay_hid_dim,
                                     out_feats_dim=lay_hid_dim,
                                     cross_msgs=self.cross_msgs,
@@ -705,43 +740,13 @@ class IEGMN(nn.Module):
         # Attention layers
         self.num_att_heads = num_att_heads
         self.out_feats_dim = lay_hid_dim
-        self.keypts_attention_lig = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.num_att_heads * self.out_feats_dim, bias=False))
-        self.keypts_queries_lig = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.num_att_heads * self.out_feats_dim, bias=False))
-        self.keypts_attention_rec = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.num_att_heads * self.out_feats_dim, bias=False))
-        self.keypts_queries_rec = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.num_att_heads * self.out_feats_dim, bias=False))
-
-        self.h_mean_lig = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim),
-            nn.Dropout(dropout),
-            get_non_lin(nonlin, leakyrelu_neg_slope),
-        )
-        self.h_mean_rec = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim),
-            nn.Dropout(dropout),
-            get_non_lin(nonlin, leakyrelu_neg_slope),
-        )
-
-        if self.unnormalized_kpt_weights:
-            self.scale_lig = nn.Linear(self.out_feats_dim, 1)
-            self.scale_rec = nn.Linear(self.out_feats_dim, 1)
         # self.reset_parameters()
 
         if self.normalize_Z_lig_directions:
             self.Z_lig_dir_norm = CoordsNorm()
         if self.normalize_Z_rec_directions:
             self.Z_rec_dir_norm = CoordsNorm()
-
-    def reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                torch.nn.init.xavier_normal_(p, gain=1.)
-            else:
-                torch.nn.init.zeros_(p)
-
+    
     def forward(self, lig_graph, rec_graph, geometry_graph, complex_names, epoch):
         orig_coords_lig = lig_graph.ndata['new_x']
         orig_coords_rec = rec_graph.ndata['x']
@@ -805,12 +810,14 @@ class IEGMN(nn.Module):
             h_feats_rec_separate =h_feats_rec
         full_trajectory = [coords_lig.detach().cpu()]
         geom_losses = 0
-        for i, layer in enumerate(self.iegmn_layers):
+        rotations = []
+        translations = []
+        for i, layer in enumerate(self.iset_layers):
             if self.debug: log('layer ', i)
             coords_lig, \
             h_feats_lig, \
             coords_rec, \
-            h_feats_rec, trajectory, geom_loss = layer(lig_graph=lig_graph,
+            h_feats_rec, trajectory, geom_loss, rotation, translation = layer(lig_graph=lig_graph,
                                 rec_graph=rec_graph,
                                 coords_lig=coords_lig,
                                 h_feats_lig=h_feats_lig,
@@ -826,13 +833,15 @@ class IEGMN(nn.Module):
             if not self.separate_lig:
                 geom_losses = geom_losses + geom_loss
                 full_trajectory.extend(trajectory)
+                rotations.append(rotation)
+                translations.append(translation)
         if self.separate_lig:
-            for i, layer in enumerate(self.iegmn_layers_separate):
+            for i, layer in enumerate(self.iset_layers_separate):
                 if self.debug: log('layer ', i)
                 coords_lig_separate, \
                 h_feats_lig_separate, \
                 coords_rec_separate, \
-                h_feats_rec_separate, trajectory, geom_loss = layer(lig_graph=lig_graph,
+                h_feats_rec_separate, trajectory, geom_loss, rotation, translation = layer(lig_graph=lig_graph,
                                     rec_graph=rec_graph,
                                     coords_lig=coords_lig_separate,
                                     h_feats_lig=h_feats_lig_separate,
@@ -847,6 +856,8 @@ class IEGMN(nn.Module):
                                     )
                 geom_losses = geom_losses + geom_loss
                 full_trajectory.extend(trajectory)
+                rotations.append(rotation)
+                translations.append(translation)
         if self.save_trajectories:
             save_name = '_'.join(complex_names)
             torch.save({'trajectories': full_trajectory, 'names': complex_names}, f'data/results/trajectories/{save_name}.pt')
@@ -854,158 +865,41 @@ class IEGMN(nn.Module):
             log(torch.max(h_feats_lig.abs()), 'max h_feats_lig after MPNN')
             log(torch.max(coords_lig.abs()), 'max coords_lig before after MPNN')
 
-        rotations = []
-        translations = []
-        recs_keypts = []
-        ligs_keypts = []
         ligs_evolved = []
+
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
         ligs_node_idx.insert(0, 0)
-        recs_node_idx = torch.cumsum(rec_graph.batch_num_nodes(), dim=0).tolist()
-        recs_node_idx.insert(0, 0)
-        if self.evolve_only:
-            for idx in range(len(ligs_node_idx) - 1):
-                lig_start = ligs_node_idx[idx]
-                lig_end = ligs_node_idx[idx + 1]
-                Z_lig_coords = coords_lig[lig_start:lig_end]
-                ligs_evolved.append(Z_lig_coords)
-            return [rotations, translations, ligs_keypts, recs_keypts, ligs_evolved, geom_losses]
 
-        ### TODO: run SVD in batches, if possible
         for idx in range(len(ligs_node_idx) - 1):
             lig_start = ligs_node_idx[idx]
             lig_end = ligs_node_idx[idx + 1]
-            rec_start = recs_node_idx[idx]
-            rec_end = recs_node_idx[idx + 1]
-            # Get H vectors
 
-            rec_feats = h_feats_rec[rec_start:rec_end]  # (m, d)
-            rec_feats_mean = torch.mean(self.h_mean_rec(rec_feats), dim=0, keepdim=True)  # (1, d)
-            lig_feats = h_feats_lig[lig_start:lig_end]  # (n, d)
-            lig_feats_mean = torch.mean(self.h_mean_lig(lig_feats), dim=0, keepdim=True)  # (1, d)
-
-            d = lig_feats.shape[1]
-            assert d == self.out_feats_dim
-            # Z coordinates
-            Z_rec_coords = coords_rec[rec_start:rec_end]
             Z_lig_coords = coords_lig[lig_start:lig_end]
 
-            # Att weights to compute the receptor centroid. They query is the average_h_ligand. Keys are each h_receptor_j
-            att_weights_rec = (self.keypts_attention_rec(rec_feats).view(-1, self.num_att_heads, d).transpose(0, 1) @
-                               self.keypts_queries_rec(lig_feats_mean).view(1, self.num_att_heads, d).transpose(0,
-                                                                                                                1).transpose(
-                                   1, 2) /
-                               math.sqrt(d)).view(self.num_att_heads, -1)
-            if not self.rec_no_softmax:
-                att_weights_rec = torch.softmax(att_weights_rec, dim=1)
-            att_weights_rec = att_weights_rec.view(self.num_att_heads, -1)
-
-            # Att weights to compute the ligand centroid. They query is the average_h_receptor. Keys are each h_ligand_i
-            att_weights_lig = (self.keypts_attention_lig(lig_feats).view(-1, self.num_att_heads, d).transpose(0, 1) @
-                               self.keypts_queries_lig(rec_feats_mean).view(1, self.num_att_heads, d).transpose(0,
-                                                                                                                1).transpose(
-                                   1, 2) /
-                               math.sqrt(d))
-            if not self.lig_no_softmax:
-                att_weights_lig = torch.softmax(att_weights_lig, dim=1)
-            att_weights_lig = att_weights_lig.view(self.num_att_heads, -1)
-
-            if self.unnormalized_kpt_weights:
-                lig_scales = self.scale_lig(lig_feats)
-                rec_scales = self.scale_rec(rec_feats)
-                Z_lig_coords = Z_lig_coords * lig_scales
-                Z_rec_coords = Z_rec_coords * rec_scales
-
-            if self.centroid_keypts_construction_rec:
-                Z_rec_mean = Z_rec_coords.mean(dim=0)
-                Z_rec_directions = Z_rec_coords - Z_rec_mean
-                if self.normalize_Z_rec_directions:
-                    Z_rec_directions = self.Z_rec_dir_norm(Z_rec_directions)
-                rec_keypts = att_weights_rec @ Z_rec_directions  # K_heads, 3
-                if self.move_keypts_back:
-                    rec_keypts += Z_rec_mean
-            else:
-                rec_keypts = att_weights_rec @ Z_rec_coords  # K_heads, 3
-
-            if self.centroid_keypts_construction or self.centroid_keypts_construction_lig:
-                Z_lig_mean = Z_lig_coords.mean(dim=0)
-                Z_lig_directions = Z_lig_coords - Z_lig_mean
-                if self.normalize_Z_lig_directions:
-                    Z_lig_directions = self.Z_lig_dir_norm(Z_lig_directions)
-                lig_keypts = att_weights_lig @ Z_lig_directions  # K_heads, 3
-                if self.move_keypts_back:
-                    lig_keypts += Z_lig_mean
-            else:
-                lig_keypts = att_weights_lig @ Z_lig_coords  # K_heads, 3
-
-            recs_keypts.append(rec_keypts)
-            ligs_keypts.append(lig_keypts)
-
-            if torch.isnan(lig_keypts).any():
-                log(complex_names, 'complex_names where Nan encountered')
-            assert not torch.isnan(lig_keypts).any()
-            if torch.isinf(lig_keypts).any():
-                log(complex_names, 'complex_names where inf encountered')
-            assert not torch.isinf(lig_keypts).any()
-            ## Apply Kabsch algorithm
-            rec_keypts_mean = rec_keypts.mean(dim=0, keepdim=True)  # (1,3)
-            lig_keypts_mean = lig_keypts.mean(dim=0, keepdim=True)  # (1,3)
-
-            A = (rec_keypts - rec_keypts_mean).transpose(0, 1) @ (lig_keypts - lig_keypts_mean) / float(
-                self.num_att_heads)  # 3, 3
-            if torch.isnan(A).any():
-                log(complex_names, 'complex_names where Nan encountered')
-            assert not torch.isnan(A).any()
-            if torch.isinf(A).any():
-                log(complex_names, 'complex_names where inf encountered')
-            assert not torch.isinf(A).any()
-
-            U, S, Vt = torch.linalg.svd(A)
-            num_it = 0
-            while torch.min(S) < 1e-3 or torch.min(
-                    torch.abs((S ** 2).view(1, 3) - (S ** 2).view(3, 1) + torch.eye(3).to(self.device))) < 1e-2:
-                if self.debug: log('S inside loop ', num_it, ' is ', S, ' and A = ', A)
-                A = A + torch.rand(3, 3).to(self.device) * torch.eye(3).to(self.device)
-                U, S, Vt = torch.linalg.svd(A)
-                num_it += 1
-                if num_it > 10: raise Exception('SVD was consitantly unstable')
-
-            corr_mat = torch.diag(torch.tensor([1, 1, torch.sign(torch.det(A))], device=self.device))
-            rotation = (U @ corr_mat) @ Vt
-
-            translation = rec_keypts_mean - torch.t(rotation @ lig_keypts_mean.t())  # (1,3)
-
-            #################### end AP 1 #########################
-
-            if self.debug:
-                log('rec_keypts_mean', rec_keypts_mean)
-                log('lig_keypts_mean', lig_keypts_mean)
-
-            rotations.append(rotation)
-            translations.append(translation)
             if self.separate_lig:
                 ligs_evolved.append(coords_lig_separate[lig_start:lig_end])
             else:
                 ligs_evolved.append(Z_lig_coords)
 
-        return [rotations, translations, ligs_keypts, recs_keypts, ligs_evolved, geom_losses]
+        return [rotations, translations, ligs_evolved, geom_losses]
 
     def __repr__(self):
-        return "IEGMN " + str(self.__dict__)
-
+        return "ISET " + str(self.__dict__)
 
 # =================================================================================================================
 
 
-class EquiBind(nn.Module):
+class SeDok(nn.Module):
 
     def __init__(self, device='cuda:0', debug=False, use_evolved_lig=False, evolve_only=False, **kwargs):
-        super(EquiBind, self).__init__()
+        super(SeDok, self).__init__()
         self.debug = debug
         self.evolve_only = evolve_only
         self.use_evolved_lig = use_evolved_lig
         self.device = device
-        self.iegmn = IEGMN(device=self.device, debug=self.debug, evolve_only=self.evolve_only, **kwargs)
+        self.iset = ISET(device=self.device, debug=self.debug, evolve_only=self.evolve_only, **kwargs)
+        if self.debug:
+            torch.autograd.set_detect_anomaly(True)
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -1017,34 +911,28 @@ class EquiBind(nn.Module):
     def forward(self, lig_graph, rec_graph, geometry_graph=None, complex_names=None, epoch=0):
         if self.debug: log(complex_names)
         predicted_ligs_coords_list = []
-        outputs = self.iegmn(lig_graph, rec_graph, geometry_graph, complex_names, epoch)
-        evolved_ligs = outputs[4]
+        outputs = self.iset(lig_graph, rec_graph, geometry_graph, complex_names, epoch)
+        evolved_ligs = outputs[2]
         if self.evolve_only:
-            return evolved_ligs, outputs[2], outputs[3], outputs[0], outputs[1], outputs[5]
+            return evolved_ligs, None, None, outputs[0], outputs[1], outputs[3]
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
         ligs_node_idx.insert(0, 0)
         for idx in range(len(ligs_node_idx) - 1):
             start = ligs_node_idx[idx]
             end = ligs_node_idx[idx + 1]
             orig_coords_lig = lig_graph.ndata['new_x'][start:end]
-            rotation = outputs[0][idx]
-            translation = outputs[1][idx]
-            assert translation.shape[0] == 1 and translation.shape[1] == 3
 
             if self.use_evolved_lig:
-                predicted_coords = (rotation @ evolved_ligs[idx].t()).t() + translation  # (n,3)
+                predicted_coords = evolved_ligs[idx]
             else:
-                predicted_coords = (rotation @ orig_coords_lig.t()).t() + translation  # (n,3)
+                predicted_coords = orig_coords_lig
+
             if self.debug:
-                log('rotation', rotation)
-                log('rotation @ rotation.t() - eye(3)', rotation @ rotation.t() - torch.eye(3).to(self.device))
-                log('translation', translation)
                 log('\n ---> predicted_coords mean - true ligand mean ',
-                    predicted_coords.mean(dim=0) - lig_graph.ndata['x'][
-                                                   start:end].mean(dim=0), '\n')
+                    predicted_coords.mean(dim=0) - lig_graph.ndata['x'].mean(dim=0), '\n')
             predicted_ligs_coords_list.append(predicted_coords)
         #torch.save({'predictions': predicted_ligs_coords_list, 'names': complex_names})
-        return predicted_ligs_coords_list, outputs[2], outputs[3], outputs[0], outputs[1], outputs[5]
+        return predicted_ligs_coords_list, None, None, outputs[0], outputs[1], outputs[3]
 
     def __repr__(self):
-        return "EquiBind " + str(self.__dict__)
+        return "SeDok " + str(self.__dict__)

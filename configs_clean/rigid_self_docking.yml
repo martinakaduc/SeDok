@@ -94,7 +94,7 @@ model_parameters:
   geometry_reg_step_size: 0.001
   geometry_regularization: False
   fine_tune: False
-  use_evolved_lig: False # Wether or not to use the evolved lig as final prediction
+  use_evolved_lig: False # Whether or not to use the evolved lig as final prediction
   standard_norm_order: True
   unnormalized_kpt_weights: False # no softmax for the weights that create the keypoints (THIS DOES NOT WORK WITH use_evolved_lig = True) (well, it does not really work at all)
   lig_evolve: True # whether or not the coordinates are changed in the EGNN layers
@@ -116,7 +116,7 @@ model_parameters:
   use_edge_features_in_gmn: True
   use_mean_node_features: True
   residue_emb_dim: 64
-  iegmn_lay_hid_dim: 64
+  lay_hid_dim: 64
   num_att_heads: 30 # 20 ic  good run
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']

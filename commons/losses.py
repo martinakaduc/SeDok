@@ -70,7 +70,7 @@ def compute_revised_intersection_loss(lig_coords, rec_coords, alpha = 0.2, beta=
     return distance_losses.sum()
 
 class BindingLoss(_Loss):
-    def __init__(self, ot_loss_weight=1, intersection_loss_weight=0, intersection_sigma=0, geom_reg_loss_weight=1, loss_rescale=True,
+    def __init__(self, ot_loss_weight=1, intersection_loss_weight=0, intersection_sigma=0, geom_reg_loss_weight=1, loss_rescale=True, orthogonal_rotation_weight=0,
                  intersection_surface_ct=0, key_point_alignmen_loss_weight=0,revised_intersection_loss_weight=0, centroid_loss_weight=0, kabsch_rmsd_weight=0,translated_lig_kpt_ot_loss=False, revised_intersection_alpha=0.1, revised_intersection_beta=8, aggression=0) -> None:
         super(BindingLoss, self).__init__()
         self.ot_loss_weight = ot_loss_weight
@@ -87,6 +87,7 @@ class BindingLoss(_Loss):
         self.aggression =aggression
         self.loss_rescale = loss_rescale
         self.geom_reg_loss_weight = geom_reg_loss_weight
+        self.orthogonal_rotation_weight = orthogonal_rotation_weight
         self.mse_loss = MSELoss()
 
     def forward(self, ligs_coords, recs_coords, ligs_coords_pred, ligs_pocket_coords, recs_pocket_coords, ligs_keypts,
@@ -148,6 +149,13 @@ class BindingLoss(_Loss):
                 translation = lig_coords_pred_mean - torch.t(rotation @ lig_coords_mean.t())  # (1,3)
                 kabsch_rmsd_loss += self.mse_loss((rotation @ lig_coords.t()).t() + translation, lig_coords_pred)
 
+            orth_rot_loss = 0
+            if self.orthogonal_rotation_weight > 0:
+                for layer in rotations:
+                    for r_mat in layer:
+                        orth_rot_loss += abs(torch.det(r_mat) - 1) + torch.norm(r_mat.T@r_mat - torch.eye(3))**2
+                orth_rot_loss = self.orthogonal_rotation_weight * orth_rot_loss
+
             centroid_loss += self.mse_loss(ligs_coords_pred[i].mean(dim=0), ligs_coords[i].mean(dim=0))
 
         if self.loss_rescale:
@@ -159,6 +167,7 @@ class BindingLoss(_Loss):
             kabsch_rmsd_loss = kabsch_rmsd_loss / float(len(ligs_coords_pred))
             intersection_loss_revised = intersection_loss_revised / float(len(ligs_coords_pred))
             geom_reg_loss = geom_reg_loss / float(len(ligs_coords_pred))
+            orth_rot_loss = orth_rot_loss / float(len(rotations)) / float(len(rotations[0]))
 
         loss = ligs_coords_loss + self.ot_loss_weight * ot_loss + self.intersection_loss_weight * intersection_loss + keypts_loss * self.key_point_alignmen_loss_weight + centroid_loss * self.centroid_loss_weight + kabsch_rmsd_loss * self.kabsch_rmsd_weight + intersection_loss_revised *self.revised_intersection_loss_weight + geom_reg_loss*self.geom_reg_loss_weight
         return loss, {'ligs_coords_loss': ligs_coords_loss, 'recs_coords_loss': recs_coords_loss, 'ot_loss': ot_loss,

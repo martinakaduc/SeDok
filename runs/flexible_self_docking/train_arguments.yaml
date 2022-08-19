@@ -80,7 +80,7 @@ model_parameters:
   final_h_layer_norm: 0
   geometry_reg_step_size: 0.001
   geometry_regularization: true
-  iegmn_lay_hid_dim: 64
+  lay_hid_dim: 64
   layer_norm: BN
   layer_norm_coords: 0
   leakyrelu_neg_slope: 0.01

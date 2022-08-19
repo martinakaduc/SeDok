@@ -130,9 +130,9 @@ def train_wrapper(args):
         run_dir = os.path.dirname(args.checkpoint)
     else:
         if args.trainer == 'torsion':
-            run_dir= f'{args.logdir}/{os.path.splitext(os.path.basename(args.config))[0]}_{args.experiment_name}_layers{mp["n_lays"]}_bs{args.batch_size}_dim{mp["iegmn_lay_hid_dim"]}_nAttH{mp["num_att_heads"]}_norm{mp["layer_norm"]}_normc{mp["layer_norm_coords"]}_normf{mp["final_h_layer_norm"]}_recAtoms{mp["use_rec_atoms"]}_numtrain{args.num_train}_{start_time}'
+            run_dir= f'{args.logdir}/{os.path.splitext(os.path.basename(args.config))[0]}_{args.experiment_name}_layers{mp["n_lays"]}_bs{args.batch_size}_dim{mp["lay_hid_dim"]}_nAttH{mp["num_att_heads"]}_norm{mp["layer_norm"]}_normc{mp["layer_norm_coords"]}_normf{mp["final_h_layer_norm"]}_recAtoms{mp["use_rec_atoms"]}_numtrain{args.num_train}_{start_time}'
         else:
-            run_dir = f'{args.logdir}/{os.path.splitext(os.path.basename(args.config))[0]}_{args.experiment_name}_layers{mp["n_lays"]}_bs{args.batch_size}_otL{lp["ot_loss_weight"]}_iL{lp["intersection_loss_weight"]}_dim{mp["iegmn_lay_hid_dim"]}_nAttH{mp["num_att_heads"]}_norm{mp["layer_norm"]}_normc{mp["layer_norm_coords"]}_normf{mp["final_h_layer_norm"]}_recAtoms{mp["use_rec_atoms"]}_numtrain{args.num_train}_{start_time}'
+            run_dir = f'{args.logdir}/{os.path.splitext(os.path.basename(args.config))[0]}_{args.experiment_name}_layers{mp["n_lays"]}_bs{args.batch_size}_otL{lp["ot_loss_weight"]}_iL{lp["intersection_loss_weight"]}_dim{mp["lay_hid_dim"]}_nAttH{mp["num_att_heads"]}_norm{mp["layer_norm"]}_normc{mp["layer_norm_coords"]}_normf{mp["final_h_layer_norm"]}_recAtoms{mp["use_rec_atoms"]}_numtrain{args.num_train}_{start_time}'
     if not os.path.exists(run_dir):
         os.mkdir(run_dir)
 

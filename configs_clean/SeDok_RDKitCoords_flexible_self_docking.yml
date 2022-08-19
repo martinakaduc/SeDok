@@ -1,4 +1,4 @@
-experiment_name: 'YourExperimentName'
+experiment_name: 'SeDok'
 seed: 1
 data_seed: 1
 
@@ -12,14 +12,15 @@ num_val:  # leave empty to use all
 collate_function: graph_collate_revised
 loss_func: BindingLoss
 loss_params:
-  ot_loss_weight: 1
+  ot_loss_weight: 0
   key_point_alignmen_loss_weight: 0 # this does only work if ot_loss_weight is not 0
   centroid_loss_weight: 0
   intersection_loss_weight: 1
   intersection_sigma: 8 # 8 was determined by gridsearch over data
   intersection_surface_ct: 1 # grid search says 2.5
   translated_lig_kpt_ot_loss: False
-  kabsch_rmsd_weight: 1
+  kabsch_rmsd_weight: 0
+  orthogonal_rotation_weight: 1
 
 
 train_names: 'data/timesplit_no_lig_overlap_train'
@@ -88,15 +89,15 @@ lr_scheduler_params:
 
 
 # Model parameters
-model_type: 'EquiBind'
+model_type: 'SeDok'
 model_parameters:
   geometry_reg_step_size: 0.001
   geometry_regularization: True
   use_evolved_lig: True # Whether or not to use the evolved lig as final prediction
   standard_norm_order: True
-  unnormalized_kpt_weights: False # no softmax for the weights that create the keypoints
-  lig_evolve: True # whether or not the coordinates are changed in the EGNN layers
-  rec_evolve: True
+  unnormalized_rotation_weights: False # no softmax for the weights that create the rotation matrix
+  lig_evolve: False # whether or not the coordinates are changed in the ISET layers
+  rec_evolve: False
   rec_no_softmax: False
   lig_no_softmax: False
   centroid_keypts_construction_rec: False
@@ -115,7 +116,7 @@ model_parameters:
   use_mean_node_features: True
   residue_emb_dim: 64
   lay_hid_dim: 64
-  num_att_heads: 30 # 20 ic  good run
+  num_att_heads: 4 # 3 for R and 1 for t
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']
   leakyrelu_neg_slope: 1.0e-2 # 1.0e-2 in  good run
