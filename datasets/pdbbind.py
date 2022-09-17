@@ -126,12 +126,12 @@ class PDBBind(Dataset):
 
         if not os.path.exists('data/processed/'):
             os.mkdir('data/processed/')
-        if (not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization.pt')) and self.geometry_regularization) \
-        or (not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt')) and self.geometry_regularization_ring) \
-        or not os.path.exists(os.path.join(self.processed_dir, 'rec_graphs.pt')) or not os.path.exists(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt')) \
-        or not os.path.exists(os.path.join(self.processed_dir, self.lig_graph_path)) or (not os.path.exists(os.path.join(self.processed_dir, self.rec_subgraph_path)) and self.rec_subgraph) \
-        or (not os.path.exists(os.path.join(self.processed_dir, 'lig_structure_graphs.pt')) and self.lig_structure_graph):
-            self.process()
+        # if (not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization.pt')) and self.geometry_regularization) \
+        # or (not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt')) and self.geometry_regularization_ring) \
+        # or not os.path.exists(os.path.join(self.processed_dir, 'rec_graphs.pt')) or not os.path.exists(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt')) \
+        # or not os.path.exists(os.path.join(self.processed_dir, self.lig_graph_path)) or (not os.path.exists(os.path.join(self.processed_dir, self.rec_subgraph_path)) and self.rec_subgraph) \
+        # or (not os.path.exists(os.path.join(self.processed_dir, 'lig_structure_graphs.pt')) and self.lig_structure_graph):
+        self.process()
 
         log('loading data into memory')
         self.coords_dict = sorted(glob.glob(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt/*')))
@@ -243,53 +243,51 @@ class PDBBind(Dataset):
         if not os.path.exists(self.processed_dir):
             os.mkdir(self.processed_dir)
 
-        get_receptor_processs = False
-        rec_graphs_process = False
-        pocket_and_rec_coords_process = False
-        rec_subgraphs_process = False
-        lig_graphs_process = False
-        lig_structure_graphs_process = False
-        geometry_regularization_process = False
-        geometry_regularization_ring_process = False
+        get_receptor_processs = True
+        rec_graphs_process = True
+        pocket_and_rec_coords_process = True
+        rec_subgraphs_process = True
+        lig_graphs_process = True
+        lig_structure_graphs_process = True
+        geometry_regularization_process = True
+        geometry_regularization_ring_process = True
+        processed_complexes = []
 
         if not os.path.exists(os.path.join(self.processed_dir, 'rec_graphs.pt')):
             log('Get receptor Graphs')
             os.mkdir(os.path.join(self.processed_dir, 'rec_graphs.pt'))
-            get_receptor_processs = True
-            rec_graphs_process = True
 
         if not os.path.exists(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt')):
             log('Get Pocket Coordinates')
             os.mkdir(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt'))
-            get_receptor_processs = True
-            pocket_and_rec_coords_process = True
 
         if (not os.path.exists(os.path.join(self.processed_dir, self.rec_subgraph_path)) and self.rec_subgraph):
             log('Get receptor subgraphs')
             os.mkdir(os.path.join(self.processed_dir, self.rec_subgraph_path))
-            get_receptor_processs = True
-            rec_subgraphs_process = True
+        elif not self.rec_subgraph:
+            rec_subgraphs_process = False
 
         if not os.path.exists(os.path.join(self.processed_dir, self.lig_graph_path)):
             log('Convert ligands to graphs')
             os.mkdir(os.path.join(self.processed_dir, self.lig_graph_path))
-            lig_graphs_process = True
 
         if not os.path.exists(os.path.join(self.processed_dir, 'lig_structure_graphs.pt')) and self.lig_structure_graph:
             log('Convert ligands to structure graphs')
             os.mkdir(os.path.join(self.processed_dir, 'lig_structure_graphs.pt'))
-            lig_structure_graphs_process = True
+        elif not self.lig_structure_graph:
+            lig_structure_graphs_process = False
 
         if not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization.pt')):
             log('Convert ligands to geometry graph')
             os.mkdir(os.path.join(self.processed_dir, 'geometry_regularization.pt'))
-            geometry_regularization_process = True
         
         if not os.path.exists(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt')):
             log('Convert ligands to geometry graph with rings')
             os.mkdir(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt'))
-            geometry_regularization_ring_process = True
-        
+        else:
+            processed_complexes = os.listdir(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt'))
+            processed_complexes = list(map(lambda x: x.split('.')[0], processed_complexes))
+
         log(f'Loading {len(complex_names)} complexes.')
 
         if self.lig_predictions_name != None:
@@ -302,7 +300,15 @@ class PDBBind(Dataset):
         else:
             lig_coords = [None] * len(complex_names)
 
-        # for name in tqdm(complex_names, desc='loading complexes'):
+        for name in processed_complexes:
+            if name in complex_names:
+                idx = complex_names.index(name)
+                lig_coords.pop(idx)
+                complex_names.pop(idx)
+
+        if len(complex_names) == 0:
+            return
+
         def process_each_complex(name, lig_coord,
                                 get_receptor_processs = False,
                                 rec_graphs_process = False,
