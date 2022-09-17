@@ -292,8 +292,18 @@ class PDBBind(Dataset):
         
         log(f'Loading {len(complex_names)} complexes.')
 
+        if self.lig_predictions_name != None:
+            lig_coords = torch.load(os.path.join('data/processed', self.lig_predictions_name))['predictions']
+            if self.bsp_ligands:
+                for idx, name in enumerate(complex_names):
+                    lig = read_molecule(os.path.join(self.bsp_dir, name, f'Lig_native.pdb'), sanitize=True, remove_hs=self.remove_h)
+                    if lig == None:
+                        lig_coords.insert(idx, None)
+        else:
+            lig_coords = [None] * len(complex_names)
+
         # for name in tqdm(complex_names, desc='loading complexes'):
-        def process_each_complex(name, lig_index,
+        def process_each_complex(name, lig_coord,
                                 get_receptor_processs = False,
                                 rec_graphs_process = False,
                                 pocket_and_rec_coords_process = False,
@@ -347,14 +357,9 @@ class PDBBind(Dataset):
                                             surface_mesh_cutoff=self.surface_mesh_cutoff,
                                             c_alpha_max_neighbors=self.c_alpha_max_neighbors)
                 save_graphs(os.path.join(self.processed_dir, 'rec_graphs.pt', name + ".pt"), rec_graph)
-
-            if self.lig_predictions_name != None:
-                lig_coords = torch.load(os.path.join('data/processed', self.lig_predictions_name))['predictions'][lig_index]
-            else:
-                lig_coords = None
     
             if rec_subgraphs_process:
-                rec_subgraph = get_receptor_atom_subgraph(rec, rec_coords, lig, lig_coords,
+                rec_subgraph = get_receptor_atom_subgraph(rec, rec_coords, lig, lig_coord,
                                     max_neighbor=self.subgraph_max_neigbor, subgraph_radius=self.subgraph_radius,
                                     graph_cutoff=self.subgraph_cutoff)
                 save_graphs(os.path.join(self.processed_dir, self.rec_subgraph_path, name + ".pt"), rec_subgraph)
@@ -386,7 +391,7 @@ class PDBBind(Dataset):
                 geometry_graph = get_geometry_graph_ring(lig)
                 save_graphs(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt', name + ".pt"), geometry_graph)
             
-        pmap_multi(process_each_complex, zip(complex_names, range(len(complex_names))), n_jobs=self.n_jobs, 
+        pmap_multi(process_each_complex, zip(complex_names, lig_coords), n_jobs=self.n_jobs, 
                 get_receptor_processs = get_receptor_processs,
                 rec_graphs_process = rec_graphs_process,
                 pocket_and_rec_coords_process = pocket_and_rec_coords_process,
