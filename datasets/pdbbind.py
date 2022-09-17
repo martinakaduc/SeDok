@@ -291,16 +291,22 @@ class PDBBind(Dataset):
             geometry_regularization_ring_process = True
         
         log(f'Loading {len(complex_names)} complexes.')
-        # ligs = []
-        # to_remove = []
-        lig_index = 0
 
-        for name in tqdm(complex_names, desc='loading complexes'):
+        # for name in tqdm(complex_names, desc='loading complexes'):
+        def process_each_complex(name, lig_index,
+                                get_receptor_processs = False,
+                                rec_graphs_process = False,
+                                pocket_and_rec_coords_process = False,
+                                rec_subgraphs_process = False,
+                                lig_graphs_process = False,
+                                lig_structure_graphs_process = False,
+                                geometry_regularization_process = False,
+                                geometry_regularization_ring_process = False):
+
             if self.bsp_ligands:
                 lig = read_molecule(os.path.join(self.bsp_dir, name, f'Lig_native.pdb'), sanitize=True, remove_hs=self.remove_h)
                 if lig == None:
-                    # to_remove.append(name)
-                    continue
+                    return
             else:
                 lig = read_molecule(os.path.join(self.pdbbind_dir, name, f'{name}_ligand.sdf'), sanitize=True,
                                     remove_hs=self.remove_h)
@@ -313,7 +319,6 @@ class PDBBind(Dataset):
                         atom.SetAtomicNum(0)
                 lig = Chem.DeleteSubstructs(lig, Chem.MolFromSmarts('[#0]'))
                 Chem.SanitizeMol(lig)
-            # ligs.append(lig)
 
             if self.bsp_proteins:
                 rec_path = os.path.join(self.bsp_dir, name, f'Rec.pdb')
@@ -323,7 +328,7 @@ class PDBBind(Dataset):
             if get_receptor_processs:
                 rec, rec_coords, c_alpha_coords, n_coords, c_coords = get_receptor(rec_path, lig, cutoff=self.chain_radius)
             else:
-                rec, rec_coords, c_alpha_coords, n_coords, c_coords = None
+                rec = rec_coords = c_alpha_coords = n_coords = c_coords = None
 
             if pocket_and_rec_coords_process:
                 pocket_coords = get_pocket_coords(lig, rec_coords, cutoff=self.pocket_cutoff, pocket_mode=self.pocket_mode)
@@ -380,7 +385,16 @@ class PDBBind(Dataset):
             if geometry_regularization_ring_process:
                 geometry_graph = get_geometry_graph_ring(lig)
                 save_graphs(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt', name + ".pt"), geometry_graph)
-
-            lig_index += 1     
+            
+        pmap_multi(process_each_complex, zip(complex_names, range(len(complex_names))), n_jobs=self.n_jobs, 
+                get_receptor_processs = get_receptor_processs,
+                rec_graphs_process = rec_graphs_process,
+                pocket_and_rec_coords_process = pocket_and_rec_coords_process,
+                rec_subgraphs_process = rec_subgraphs_process,
+                lig_graphs_process = lig_graphs_process,
+                lig_structure_graphs_process = lig_structure_graphs_process,
+                geometry_regularization_process = geometry_regularization_process,
+                geometry_regularization_ring_process = geometry_regularization_ring_process,
+                desc='processing complexes')
 
         get_reusable_executor().shutdown(wait=True)
