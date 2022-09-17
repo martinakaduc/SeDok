@@ -151,9 +151,9 @@ class BindingLoss(_Loss):
 
             orth_rot_loss = 0
             if self.orthogonal_rotation_weight > 0:
-                for layer in rotations:
-                    for r_mat in layer:
-                        orth_rot_loss += abs(torch.det(r_mat) - 1) + torch.norm(r_mat.T@r_mat - torch.eye(3))**2
+                for r_mat in rotations:
+                    # for r_mat in layer:
+                    orth_rot_loss += abs(torch.det(r_mat) - 1) + torch.norm(r_mat.T@r_mat - torch.eye(3))**2
                 orth_rot_loss = self.orthogonal_rotation_weight * orth_rot_loss
 
             centroid_loss += self.mse_loss(ligs_coords_pred[i].mean(dim=0), ligs_coords[i].mean(dim=0))
@@ -167,7 +167,7 @@ class BindingLoss(_Loss):
             kabsch_rmsd_loss = kabsch_rmsd_loss / float(len(ligs_coords_pred))
             intersection_loss_revised = intersection_loss_revised / float(len(ligs_coords_pred))
             geom_reg_loss = geom_reg_loss / float(len(ligs_coords_pred))
-            orth_rot_loss = orth_rot_loss / float(len(rotations)) / float(len(rotations[0]))
+            orth_rot_loss = orth_rot_loss / float(len(rotations))# / float(len(rotations[0]))
 
         loss = ligs_coords_loss + self.ot_loss_weight * ot_loss + self.intersection_loss_weight * intersection_loss + keypts_loss * self.key_point_alignmen_loss_weight + centroid_loss * self.centroid_loss_weight + kabsch_rmsd_loss * self.kabsch_rmsd_weight + intersection_loss_revised *self.revised_intersection_loss_weight + geom_reg_loss*self.geom_reg_loss_weight
         return loss, {'ligs_coords_loss': ligs_coords_loss, 'recs_coords_loss': recs_coords_loss, 'ot_loss': ot_loss,

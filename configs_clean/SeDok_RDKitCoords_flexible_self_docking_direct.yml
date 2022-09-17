@@ -14,7 +14,7 @@ loss_func: BindingLoss
 loss_params:
   ot_loss_weight: 0
   key_point_alignmen_loss_weight: 0 # this does only work if ot_loss_weight is not 0
-  centroid_loss_weight: 0
+  centroid_loss_weight: 1
   intersection_loss_weight: 1
   intersection_sigma: 8 # 8 was determined by gridsearch over data
   intersection_surface_ct: 1 # grid search says 2.5
@@ -26,7 +26,7 @@ loss_params:
 train_names: 'data/timesplit_no_lig_overlap_train'
 val_names: 'data/timesplit_no_lig_overlap_val'
 test_names: 'data/timesplit_test'
-num_workers: 0
+num_workers: 4
 dataset_params:
   geometry_regularization_ring: True
   use_rdkit_coords: True #
@@ -66,7 +66,6 @@ metrics:
   - median_centroid_distance
   - centroid_distance_less_than_2
   - mean_centroid_distance
-  - kabsch_rmsd
   - rmsd_less_than_2
   - rmsd_less_than_5
 main_metric: rmsd_less_than_2 # used for early stopping etc
@@ -96,8 +95,8 @@ model_parameters:
   use_evolved_lig: True # Whether or not to use the evolved lig as final prediction
   standard_norm_order: True
   unnormalized_rotation_weights: False # no softmax for the weights that create the rotation matrix
-  lig_evolve: False # whether or not the coordinates are changed in the ISET layers
-  rec_evolve: False
+  lig_evolve: True # whether or not the coordinates are changed in the ISET layers
+  rec_evolve: True
   rec_no_softmax: False
   lig_no_softmax: False
   centroid_keypts_construction_rec: False
@@ -106,9 +105,9 @@ model_parameters:
   move_keypts_back: True # move the constructed keypoints back to the location of the ligand
   normalize_Z_rec_directions: False
   normalize_Z_lig_directions: False
-  n_lays: 8  # 5 in  good run
+  n_lays: 4  # 5 in  good run
   debug: False
-  use_rec_atoms: False
+  use_rec_atoms: False 
   shared_layers: False # False in good run
   noise_decay_rate: 0.5
   noise_initial: 1
@@ -116,7 +115,9 @@ model_parameters:
   use_mean_node_features: True
   residue_emb_dim: 64
   lay_hid_dim: 64
-  num_att_heads: 4 # 3 for R and 1 for t
+  multihop_strategy:
+  locknkey: "direct"
+  num_att_heads: 0
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']
   leakyrelu_neg_slope: 1.0e-2 # 1.0e-2 in  good run

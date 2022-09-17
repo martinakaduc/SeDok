@@ -47,6 +47,59 @@ class GraphNorm(nn.Module):
             return norm_x
 
 
+def normalize(v):
+    return v / torch.linalg.norm(v)
+
+
+def find_additional_vertical_vector(vector, device):
+    ez = torch.FloatTensor([0, 0, 1]).to(device)
+    look_at_vector = normalize(vector)
+    up_vector = normalize(ez - torch.dot(look_at_vector, ez) * look_at_vector)
+    return up_vector
+
+
+def calc_rotation_matrix(v1_start, v2_start, v1_target, v2_target):
+    """
+    calculating M the rotation matrix from base U to base V
+    M @ U = V
+    M = V @ U^-1
+    """
+
+    def get_base_matrices():
+        u1_start = normalize(v1_start)
+        u2_start = normalize(v2_start)
+        u3_start = normalize(torch.cross(u1_start, u2_start))
+
+        u1_target = normalize(v1_target)
+        u2_target = normalize(v2_target)
+        u3_target = normalize(torch.cross(u1_target, u2_target))
+
+        U = torch.hstack([u1_start.view(3, 1), u2_start.view(3, 1), u3_start.view(3, 1)])
+        V = torch.hstack([u1_target.view(3, 1), u2_target.view(3, 1), u3_target.view(3, 1)])
+
+        return U, V
+
+    def calc_base_transition_matrix(U, V):
+        return V@torch.linalg.inv(U)
+
+    # if not torch.isclose(torch.dot(v1_target, v2_target), torch.zeros(1), atol=1e-03):
+    #     raise ValueError("v1_target and v2_target must be vertical")
+
+    U, V = get_base_matrices()
+    return calc_base_transition_matrix(U, V)
+
+
+def get_rotation_matrix(start_look_at_vector, target_look_at_vector, start_up_vector=None, target_up_vector=None, device='cpu'):
+    if start_up_vector is None:
+        start_up_vector = find_additional_vertical_vector(start_look_at_vector, device)
+
+    if target_up_vector is None:
+        target_up_vector = find_additional_vertical_vector(target_look_at_vector, device)
+
+    rot_mat = calc_rotation_matrix(start_look_at_vector, start_up_vector, target_look_at_vector, target_up_vector)
+    return rot_mat
+
+
 def get_non_lin(type, negative_slope):
     if type == 'swish':
         return nn.SiLU()
@@ -164,7 +217,10 @@ class ISET_Layer(nn.Module):
             norm_cross_coords_update= False,
             loss_geometry_regularization = False,
             geom_reg_steps= 1,
-        geometry_reg_step_size=0.1
+            geometry_reg_step_size=0.1,
+            lig_no_softmax=False,
+            rec_no_softmax=False,
+            multihop_strategy=None
     ):
 
         super(ISET_Layer, self).__init__()
@@ -194,6 +250,9 @@ class ISET_Layer(nn.Module):
         self.geometry_regularization = geometry_regularization
         self.geom_reg_steps = geom_reg_steps
         self.save_trajectories = save_trajectories
+        self.lig_no_softmax = lig_no_softmax
+        self.rec_no_softmax = rec_no_softmax
+        self.multihop_strategy = multihop_strategy
 
         # EDGES
         lig_edge_mlp_input_dim = (h_feats_dim * 2) + lig_input_edge_feats_dim
@@ -276,7 +335,7 @@ class ISET_Layer(nn.Module):
         )
         if self.standard_norm_order:
             self.node_mlp_lig = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + self.out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
                 get_layer_norm(layer_norm, h_feats_dim),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Dropout(dropout),
@@ -285,7 +344,7 @@ class ISET_Layer(nn.Module):
             )
         else:
             self.node_mlp_lig = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + self.out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
                 nn.Dropout(dropout),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 get_layer_norm(layer_norm, h_feats_dim),
@@ -293,7 +352,7 @@ class ISET_Layer(nn.Module):
             )
         if self.standard_norm_order:
             self.node_mlp = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + self.out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
                 get_layer_norm(layer_norm, h_feats_dim),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Dropout(dropout),
@@ -302,7 +361,7 @@ class ISET_Layer(nn.Module):
             )
         else:
             self.node_mlp = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + self.out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
                 nn.Dropout(dropout),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 get_layer_norm(layer_norm, h_feats_dim),
@@ -377,25 +436,6 @@ class ISET_Layer(nn.Module):
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Linear(h_feats_dim, 1),
             )
-
-        # Rotation matrix & translation vector
-        self.W_feature = nn.Linear(out_feats_dim, out_feats_dim, bias=False)
-        self.R_linear = nn.Linear(3, 3, bias=False)
-        self.R_norm = get_norm("LN", 3)
-
-        self.t_linear = nn.Linear(3, 3, bias=False)
-
-        self.h_mean_lig = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim),
-            nn.Dropout(dropout),
-            get_non_lin(nonlin, leakyrelu_neg_slope),
-        )
-
-        self.keypts_attention_rec = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
-
-        self.keypts_queries_rec = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -498,28 +538,88 @@ class ISET_Layer(nn.Module):
             lig_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
             rec_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
 
+            if self.fine_tune:
+                x_evolved_lig = x_evolved_lig + self.att_mlp_cross_coors_V_lig(h_feats_lig) * (
+                        self.lig_cross_coords_norm(lig_graph.ndata['x_now'] - cross_attention(self.att_mlp_cross_coors_Q_lig(h_feats_lig),
+                                                                   self.att_mlp_cross_coors_K(h_feats_rec),
+                                                                   rec_graph.ndata['x_now'], mask, self.cross_msgs)))
+            if self.fine_tune:
+                x_evolved_rec = x_evolved_rec + self.att_mlp_cross_coors_V(h_feats_rec) * (
+                        self.rec_cross_coords_norm(rec_graph.ndata['x_now'] - cross_attention(self.att_mlp_cross_coors_Q(h_feats_rec),
+                                                                   self.att_mlp_cross_coors_K_lig(h_feats_lig),
+                                                                   lig_graph.ndata['x_now'], mask.transpose(0, 1),
+                                                                   self.cross_msgs)))
+            trajectory = []
+            if self.save_trajectories: trajectory.append(x_evolved_lig.detach().cpu())
+            if self.loss_geometry_regularization:
+                src, dst = geometry_graph.edges()
+                src = src.long()
+                dst = dst.long()
+                d_squared = torch.sum((x_evolved_lig[src] - x_evolved_lig[dst]) ** 2, dim=1)
+                geom_loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2) ** 2)
+            else:
+                geom_loss = 0
+            if self.geometry_regularization:
+                src, dst = geometry_graph.edges()
+                src = src.long()
+                dst = dst.long()
+                for step in range(self.geom_reg_steps): # T
+                    d_squared = torch.sum((x_evolved_lig[src] - x_evolved_lig[dst]) ** 2, dim=1) # d_z
+                    Loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2)**2) # this is the loss whose gradient we are calculating here
+                    grad_d_squared = 2 * (x_evolved_lig[src] - x_evolved_lig[dst])
+                    geometry_graph.edata['partial_grads'] = 2 * (d_squared - geometry_graph.edata['feat'] ** 2)[:,None] * grad_d_squared
+                    geometry_graph.update_all(fn.copy_edge('partial_grads', 'partial_grads_msg'),
+                                              fn.sum('partial_grads_msg', 'grad_x_evolved'))
+                    grad_x_evolved = geometry_graph.ndata['grad_x_evolved']
+                    x_evolved_lig = x_evolved_lig + self.geometry_reg_step_size * grad_x_evolved
+                    if self.save_trajectories:
+                        trajectory.append(x_evolved_lig.detach().cpu())
+
             if self.debug:
                 log(torch.max(lig_graph.ndata['aggr_msg'].abs()), 'data[aggr_msg]: \sum_j m_{i->j}')
+                if self.lig_evolve:
+                    log(torch.max(lig_graph.ndata['x_update'].abs()),
+                        'data[x_update] : \sum_j (x_i - x_j) * \phi^x(m_{i->j})')
+                    log(torch.max(x_evolved_lig.abs()), 'x_i new = x_evolved_lig : x_i + data[x_update]')
 
-            input_node_upd_ligand = torch.cat((self.node_norm(lig_graph.ndata['feat']),
-                                               lig_graph.ndata['aggr_msg'],
+            input_node_upd_ligand = torch.cat((lig_graph.ndata['aggr_msg'],
                                                cross_attention_lig_feat,
                                                original_ligand_node_features), dim=-1)
 
-            input_node_upd_receptor = torch.cat((self.node_norm(rec_graph.ndata['feat']),
-                                                 rec_graph.ndata['aggr_msg'],
+            input_node_upd_receptor = torch.cat((rec_graph.ndata['aggr_msg'],
                                                  cross_attention_rec_feat,
                                                  original_receptor_node_features), dim=-1)
 
-            # Skip connections
-            if self.h_feats_dim == self.out_feats_dim:
-                node_upd_ligand = self.skip_weight_h * self.node_mlp_lig(input_node_upd_ligand) + (
-                        1. - self.skip_weight_h) * h_feats_lig
-                node_upd_receptor = self.skip_weight_h * self.node_mlp(input_node_upd_receptor) + (
-                        1. - self.skip_weight_h) * h_feats_rec
+            if not self.multihop_strategy:
+                # Skip connections 1-hop
+                if self.h_feats_dim == self.out_feats_dim:
+                    node_upd_ligand = self.skip_weight_h * self.node_mlp_lig(input_node_upd_ligand) + (
+                            1. - self.skip_weight_h) * h_feats_lig
+                    node_upd_receptor = self.skip_weight_h * self.node_mlp(input_node_upd_receptor) + (
+                            1. - self.skip_weight_h) * h_feats_rec
+                else:
+                    node_upd_ligand = self.node_mlp_lig(input_node_upd_ligand)
+                    node_upd_receptor = self.node_mlp(input_node_upd_receptor)
             else:
+                # Multi-hop
                 node_upd_ligand = self.node_mlp_lig(input_node_upd_ligand)
                 node_upd_receptor = self.node_mlp(input_node_upd_receptor)
+                
+                # e = torch.einsum('ijl,ikl->ijk', (torch.matmul(node_upd_ligand, self.A), node_upd_ligand))
+                # e = e + e.permute((0,2,1))
+
+                # lig_graph.apply_edges(self.local_attn_lig)  ## i->j edge:  [h_i h_j]
+                # rec_graph.apply_edges(self.local_attn_rec) # get feature cura node va tin htoan
+
+                # local_attention = torch.where(adj > 0, e, self.zeros)
+                # local_attention = torch.softmax(local_attention, dim=1)
+
+                # z = node_upd_ligand
+                # for _ in range(self.nhop):
+                #     az = torch.relu(torch.einsum('aij,ajk->aik',(local_attention, z)))
+                #     coeff = torch.sigmoid(self.gate(torch.cat([h, az], -1))).repeat(1, 1, h.size(-1))
+                #     z = coeff * node_upd_ligand + (1 - coeff) * az
+
 
             if self.debug:
                 log('node_mlp params')
@@ -534,73 +634,25 @@ class ISET_Layer(nn.Module):
             node_upd_receptor = apply_norm(rec_graph, node_upd_receptor,
                                            self.final_h_layer_norm, self.final_h_layernorm_layer)
 
-            rotation_matrices = []
-            translation_vectors = []
-            list_x_evolved_lig = []
+            # rotation_matrices = []
+            # translation_vectors = []
 
-            # Seperate each ligand and protein
-            ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
-            ligs_node_idx.insert(0, 0)
-            recs_node_idx = torch.cumsum(rec_graph.batch_num_nodes(), dim=0).tolist()
-            recs_node_idx.insert(0, 0)
-
-            for idx in range(len(ligs_node_idx) - 1):
-                lig_start = ligs_node_idx[idx]
-                lig_end = ligs_node_idx[idx + 1]
-                rec_start = recs_node_idx[idx]
-                rec_end = recs_node_idx[idx + 1]
-
-                node_upd_per_ligand = node_upd_ligand[lig_start:lig_end]
-                node_upd_per_receptor = node_upd_receptor[rec_start:rec_end]
-                x_evolved_per_lig = x_evolved_lig[lig_start:lig_end]
-                x_evolved_per_rec = x_evolved_rec[rec_start:rec_end]
-
-
-                rotation_matrix = self.W_feature(node_upd_per_receptor) @ node_upd_per_ligand.T + \
-                                (self.W_feature(node_upd_per_ligand) @ node_upd_per_receptor.T).T
-
-                rotation_matrix = self.R_linear(x_evolved_per_rec.T @ rotation_matrix @ x_evolved_per_lig)
-                rotation_matrix = apply_norm(None, rotation_matrix, "LN", self.R_norm)
-                    
-                x_evolved_per_lig = (rotation_matrix @ x_evolved_per_lig.T).T
-
-                d = node_upd_per_ligand.shape[1]
-
-                lig_feats_mean = torch.mean(self.h_mean_lig(node_upd_per_ligand), dim=0, keepdim=True)  # (1, d)
-
-                att_weights_rec = (self.keypts_attention_rec(node_upd_per_receptor).view(-1, 1, d).transpose(0, 1) @
-                                self.keypts_queries_rec(lig_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
-                                math.sqrt(d)).view(1, -1)
-
-                translation_vector = self.t_linear(att_weights_rec @ x_evolved_per_rec - torch.mean(x_evolved_per_lig))
-
-                list_x_evolved_lig.append(x_evolved_per_lig + translation_vector)
-
-                rotation_matrices.append(rotation_matrix)
-                translation_vectors.append(translation_vector)
-
-                if self.debug:
-                    log('rotation', rotation_matrix)
-                    log('rotation @ rotation.t() - eye(3)', rotation_matrix @ rotation_matrix.T - torch.eye(3).to(self.device))
-                    log('translation', translation_vector)
-                    log(torch.max(x_evolved_per_lig.abs()), 'x_i new')
-
-            # log(list_x_evolved_lig[0].shape)
-            new_x_evolved_lig = torch.cat(list_x_evolved_lig, 0)
-            trajectory = []
-            if self.save_trajectories:
-                trajectory.append(new_x_evolved_lig.detach().cpu())
+            ##### CALCULATING ROTATION MATRIX AND TRANSLATION VECTOR #####
             
-            if self.loss_geometry_regularization:
-                src, dst = geometry_graph.edges()
-                src = src.long()
-                dst = dst.long()
-                d_squared = torch.sum((new_x_evolved_lig[src] - new_x_evolved_lig[dst]) ** 2, dim=1)
-                geom_loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2) ** 2)
-            else:
-                geom_loss = 0
+            # trajectory = []
+            # if self.save_trajectories:
+            #     trajectory.append(new_x_evolved_lig.detach().cpu())
+            
+            # if self.loss_geometry_regularization:
+            #     src, dst = geometry_graph.edges()
+            #     src = src.long()
+            #     dst = dst.long()
+            #     d_squared = torch.sum((new_x_evolved_lig[src] - new_x_evolved_lig[dst]) ** 2, dim=1)
+            #     geom_loss = torch.sum((d_squared - geometry_graph.edata['feat'] ** 2) ** 2)
+            # else:
+            #     geom_loss = 0
 
-        return new_x_evolved_lig, node_upd_ligand, x_evolved_rec, node_upd_receptor, trajectory, geom_loss, rotation_matrices, translation_vectors
+        return x_evolved_lig, node_upd_ligand, x_evolved_rec, node_upd_receptor, trajectory, geom_loss#, rotation_matrices, translation_vectors
 
     def __repr__(self):
         return "ISET Layer " + str(self.__dict__)
@@ -608,8 +660,8 @@ class ISET_Layer(nn.Module):
 # =================================================================================================================
 class ISET(nn.Module):
     def __init__(self, n_lays, debug, device, use_rec_atoms, shared_layers, noise_decay_rate, cross_msgs, noise_initial,
-                 use_edge_features_in_gmn, use_mean_node_features, residue_emb_dim, lay_hid_dim, num_att_heads,
-                 dropout, nonlin, leakyrelu_neg_slope, random_vec_dim=0, random_vec_std=1, use_scalar_features=True,
+                 use_edge_features_in_gmn, use_mean_node_features, residue_emb_dim, lay_hid_dim, locknkey,
+                 dropout, nonlin, leakyrelu_neg_slope, num_att_heads=0, random_vec_dim=0, random_vec_std=1, use_scalar_features=True,
                  num_lig_feats=None, move_keypts_back=False, normalize_Z_lig_directions=False,
                  unnormalized_rotation_weights=False, centroid_keypts_construction_rec=False,
                  centroid_keypts_construction_lig=False, rec_no_softmax=False, lig_no_softmax=False,
@@ -638,6 +690,9 @@ class ISET(nn.Module):
         self.rec_no_softmax = rec_no_softmax
         self.lig_no_softmax = lig_no_softmax
         self.evolve_only = evolve_only
+        self.locknkey = locknkey
+
+        assert self.locknkey in ["direct", "indirect"]
 
         self.lig_atom_embedder = AtomEncoder(emb_dim=residue_emb_dim - self.random_vec_dim,
                                              feature_dims=lig_feature_dims, use_scalar_feat=use_scalar_features,
@@ -747,6 +802,52 @@ class ISET(nn.Module):
         if self.normalize_Z_rec_directions:
             self.Z_rec_dir_norm = CoordsNorm()
     
+        # Rotation matrix & translation vector
+        # self.W_feature = nn.Linear(out_feats_dim, out_feats_dim, bias=False)
+        # self.R_linear = nn.Linear(3, 3, bias=False)
+        # self.R_norm = get_norm("LN", 3)
+        # self.feat_2_coord = nn.Linear(out_feats_dim, 3, bias=False)
+
+        self.h_mean_lig = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim),
+            nn.Dropout(dropout),
+            get_non_lin(nonlin, leakyrelu_neg_slope),
+        )
+
+        self.h_mean_rec = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim),
+            nn.Dropout(dropout),
+            get_non_lin(nonlin, leakyrelu_neg_slope),
+        )
+        
+        self.keypts_attention_rec_trans = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_queries_rec_trans = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_attention_rec_rot = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_queries_rec_rot = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_attention_lig_fixed = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_queries_lig_fixed = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_attention_lig_rot = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.keypts_queries_lig_rot = nn.Sequential(
+            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+
+        self.xy_mask = torch.Tensor([1, 1, 0]).to(self.device)
+        self.yz_mask = torch.Tensor([0, 1, 1]).to(self.device)
+        self.zx_mask = torch.Tensor([1, 0, 1]).to(self.device)
+
     def forward(self, lig_graph, rec_graph, geometry_graph, complex_names, epoch):
         orig_coords_lig = lig_graph.ndata['new_x']
         orig_coords_rec = rec_graph.ndata['x']
@@ -810,14 +911,14 @@ class ISET(nn.Module):
             h_feats_rec_separate =h_feats_rec
         full_trajectory = [coords_lig.detach().cpu()]
         geom_losses = 0
-        rotations = []
-        translations = []
+        # rotations = []
+        # translations = []
         for i, layer in enumerate(self.iset_layers):
             if self.debug: log('layer ', i)
             coords_lig, \
             h_feats_lig, \
             coords_rec, \
-            h_feats_rec, trajectory, geom_loss, rotation, translation = layer(lig_graph=lig_graph,
+            h_feats_rec, trajectory, geom_loss = layer(lig_graph=lig_graph,
                                 rec_graph=rec_graph,
                                 coords_lig=coords_lig,
                                 h_feats_lig=h_feats_lig,
@@ -833,15 +934,15 @@ class ISET(nn.Module):
             if not self.separate_lig:
                 geom_losses = geom_losses + geom_loss
                 full_trajectory.extend(trajectory)
-                rotations.append(rotation)
-                translations.append(translation)
+                # rotations.append(rotation)
+                # translations.append(translation)
         if self.separate_lig:
             for i, layer in enumerate(self.iset_layers_separate):
                 if self.debug: log('layer ', i)
                 coords_lig_separate, \
                 h_feats_lig_separate, \
                 coords_rec_separate, \
-                h_feats_rec_separate, trajectory, geom_loss, rotation, translation = layer(lig_graph=lig_graph,
+                h_feats_rec_separate, trajectory, geom_loss = layer(lig_graph=lig_graph,
                                     rec_graph=rec_graph,
                                     coords_lig=coords_lig_separate,
                                     h_feats_lig=h_feats_lig_separate,
@@ -856,8 +957,8 @@ class ISET(nn.Module):
                                     )
                 geom_losses = geom_losses + geom_loss
                 full_trajectory.extend(trajectory)
-                rotations.append(rotation)
-                translations.append(translation)
+                # rotations.append(rotation)
+                # translations.append(translation)
         if self.save_trajectories:
             save_name = '_'.join(complex_names)
             torch.save({'trajectories': full_trajectory, 'names': complex_names}, f'data/results/trajectories/{save_name}.pt')
@@ -865,21 +966,155 @@ class ISET(nn.Module):
             log(torch.max(h_feats_lig.abs()), 'max h_feats_lig after MPNN')
             log(torch.max(coords_lig.abs()), 'max coords_lig before after MPNN')
 
+        rotations = []
+        translations = []
         ligs_evolved = []
-
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
         ligs_node_idx.insert(0, 0)
+        recs_node_idx = torch.cumsum(rec_graph.batch_num_nodes(), dim=0).tolist()
+        recs_node_idx.insert(0, 0)
+
+        if self.evolve_only:
+            for idx in range(len(ligs_node_idx) - 1):
+                lig_start = ligs_node_idx[idx]
+                lig_end = ligs_node_idx[idx + 1]
+                Z_lig_coords = coords_lig[lig_start:lig_end]
+                ligs_evolved.append(Z_lig_coords)
+            return [rotations, translations, ligs_evolved, geom_losses]
 
         for idx in range(len(ligs_node_idx) - 1):
             lig_start = ligs_node_idx[idx]
             lig_end = ligs_node_idx[idx + 1]
+            rec_start = recs_node_idx[idx]
+            rec_end = recs_node_idx[idx + 1]
 
-            Z_lig_coords = coords_lig[lig_start:lig_end]
+            node_upd_per_ligand = h_feats_lig[lig_start:lig_end]
+            node_upd_per_receptor = h_feats_rec[rec_start:rec_end]
+            x_evolved_per_lig = coords_lig[lig_start:lig_end]
+            x_evolved_per_rec = coords_rec[rec_start:rec_end]
 
             if self.separate_lig:
                 ligs_evolved.append(coords_lig_separate[lig_start:lig_end])
+                continue
+
+            d = node_upd_per_ligand.shape[1]
+
+            lig_feats_mean = torch.mean(self.h_mean_lig(node_upd_per_ligand), dim=0, keepdim=True)  # (1, d)
+            rec_feats_mean = torch.mean(self.h_mean_rec(node_upd_per_receptor), dim=0, keepdim=True)  # (1, d)
+            lig_centroid = torch.mean(x_evolved_per_lig, dim=0, keepdim=True)
+            rec_centroid = torch.mean(x_evolved_per_rec, dim=0, keepdim=True)
+
+            # attn_lig_fixed = (self.keypts_attention_lig_fixed(node_upd_per_ligand).view(-1, 1, d).transpose(0, 1) @
+            #                self.keypts_queries_lig_fixed(rec_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
+            #                math.sqrt(d)).view(1, -1)
+
+            # if not self.lig_no_softmax:
+            #     attn_lig_fixed = torch.softmax(attn_lig_fixed, dim=1)
+            
+            # lig_fixed_vec = self.feat_2_coord(attn_lig_fixed @ node_upd_per_ligand)
+
+            attn_lig_rot = (self.keypts_attention_lig_rot(node_upd_per_ligand).view(-1, 1, d).transpose(0, 1) @
+                            self.keypts_queries_lig_rot(rec_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
+                            math.sqrt(d)).view(1, -1)
+
+            if not self.lig_no_softmax:
+                attn_lig_rot = torch.softmax(attn_lig_rot, dim=1)
+
+            lig_rot_vec = attn_lig_rot @ x_evolved_per_lig - lig_centroid
+            lig_rot_vec = lig_rot_vec / torch.linalg.norm(lig_rot_vec)
+            lig_fixed_vec = lig_rot_vec
+
+            attn_rec_rot = (self.keypts_attention_rec_rot(node_upd_per_receptor).view(-1, 1, d).transpose(0, 1) @
+                            self.keypts_queries_rec_rot(lig_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
+                            math.sqrt(d)).view(1, -1)
+
+            if not self.rec_no_softmax:
+                attn_rec_rot = torch.softmax(attn_rec_rot, dim=1)
+
+            rec_rot_vec = rec_centroid - attn_rec_rot @ x_evolved_per_rec
+            rec_rot_vec = rec_rot_vec / torch.linalg.norm(rec_rot_vec)
+
+            # Ver 1
+            # rotation_matrix = self.W_feature(node_upd_per_receptor) @ node_upd_per_ligand.T + \
+            #                 (self.W_feature(node_upd_per_ligand) @ node_upd_per_receptor.T).T
+
+            # rotation_matrix = self.R_linear(x_evolved_per_rec.T @ rotation_matrix @ x_evolved_per_lig)
+            # rotation_matrix = apply_norm(None, rotation_matrix, "LN", self.R_norm)
+
+            if self.locknkey == "direct":
+                # Ver 2: Directly
+                rotation_matrix = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], device=self.device)
+
+            elif self.locknkey == "indirect":
+                # Ver 3: Indirectly
+                lig_fixed_vec_xy = lig_fixed_vec * self.xy_mask
+                lig_fixed_vec_yz = lig_fixed_vec * self.yz_mask
+                lig_fixed_vec_zx = lig_fixed_vec * self.zx_mask
+
+                rec_rot_vec_xy = rec_rot_vec * self.xy_mask
+                rec_rot_vec_yz = rec_rot_vec * self.yz_mask
+                rec_rot_vec_zx = rec_rot_vec * self.zx_mask
+
+                # v1: [x1; y1]: lig_fixed
+                # v2: [x2; y2]: rec_rot
+                # atan2(x1*y2 - y1*x2; x1*x2 + y1*y2)
+                
+                alpha = torch.atan2(lig_fixed_vec_xy[:,0] * rec_rot_vec_xy[:,1] - lig_fixed_vec_xy[:,1] * rec_rot_vec_xy[:,0],
+                                    lig_fixed_vec_xy[:,0] * rec_rot_vec_xy[:,0] + lig_fixed_vec_xy[:,1] * rec_rot_vec_xy[:,1])
+
+                beta = torch.atan2(lig_fixed_vec_zx[:,0] * rec_rot_vec_zx[:,1] - lig_fixed_vec_zx[:,1] * rec_rot_vec_zx[:,0],
+                                    lig_fixed_vec_zx[:,0] * rec_rot_vec_zx[:,0] + lig_fixed_vec_zx[:,1] * rec_rot_vec_zx[:,1])
+
+                gamma = torch.atan2(lig_fixed_vec_yz[:,0] * rec_rot_vec_yz[:,1] - lig_fixed_vec_yz[:,1] * rec_rot_vec_yz[:,0],
+                                    lig_fixed_vec_yz[:,0] * rec_rot_vec_yz[:,0] + lig_fixed_vec_yz[:,1] * rec_rot_vec_yz[:,1])
+
+                R_z = torch.FloatTensor([[0, 0, 0], [0, 0, 0], [0, 0, 1]]).to(self.device)
+                R_y = torch.FloatTensor([[0, 0, 0], [0, 1, 0], [0, 0, 0]]).to(self.device)
+                R_x = torch.FloatTensor([[1, 0, 0], [0, 0, 0], [0, 0, 0]]).to(self.device)
+
+                R_z[0][0] = torch.cos(alpha)
+                R_z[0][1] = -torch.sin(alpha)
+                R_z[1][0] = torch.sin(alpha)
+                R_z[1][1] = torch.cos(alpha)
+
+                R_y[0][0] = torch.cos(beta)
+                R_y[0][2] = torch.sin(beta)
+                R_y[2][0] = -torch.sin(beta)
+                R_y[2][2] = torch.cos(beta)
+
+                R_x[1][1] = torch.cos(gamma)
+                R_x[1][2] = -torch.sin(gamma)
+                R_x[2][1] = torch.sin(gamma)
+                R_x[2][2] = torch.cos(gamma)
+
+                rotation_matrix = R_z @ R_y @ R_x
             else:
-                ligs_evolved.append(Z_lig_coords)
+                rotation_matrix = torch.eye(3).to(self.device)
+                
+            x_evolved_per_lig = (rotation_matrix @ (x_evolved_per_lig).T).T
+            # x_evolved_per_lig = (rotation_matrix @ (x_evolved_per_lig-lig_centroid).T).T + lig_centroid
+
+            att_weights_rec_trans = (self.keypts_attention_rec_trans(node_upd_per_receptor).view(-1, 1, d).transpose(0, 1) @
+                            self.keypts_queries_rec_trans(lig_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
+                            math.sqrt(d)).view(1, -1)
+
+            if not self.rec_no_softmax:
+                att_weights_rec_trans = torch.softmax(att_weights_rec_trans, dim=1)
+
+            predicted_lig_centroid = att_weights_rec_trans @ x_evolved_per_rec
+            translation_vector = predicted_lig_centroid - torch.mean(x_evolved_per_lig, dim=0, keepdim=True)
+            
+            if self.debug:
+                log('rotation', rotation_matrix)
+                log('rotation @ rotation.t() - eye(3)', rotation_matrix @ rotation_matrix.T - torch.eye(3).to(self.device))
+                log('translation', translation_vector)
+                log(torch.max(x_evolved_per_lig.abs()), 'x_i new')
+                log("Centroid changed?", lig_centroid - torch.mean(x_evolved_per_lig, dim=0, keepdim=True))
+
+            ligs_evolved.append(x_evolved_per_lig + translation_vector)
+
+            rotations.append(rotation_matrix)
+            translations.append(translation_vector)
 
         return [rotations, translations, ligs_evolved, geom_losses]
 
