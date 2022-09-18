@@ -7,6 +7,7 @@ from typing import Dict, Callable
 import pyaml
 import torch
 import numpy as np
+from tqdm import tqdm
 
 from datasets.samplers import HardSampler
 from models import *  # do not remove
@@ -137,7 +138,7 @@ class Trainer():
         epoch_targets = []
         epoch_predictions = []
         epoch_loss = 0
-        for i, batch in enumerate(data_loader):
+        for i, batch in tqdm(enumerate(data_loader)):
             *batch, batch_indices = move_to_device(list(batch), self.device)
             # loss components is either none, or a dict with the components of the loss function
             loss, loss_components, predictions, targets = self.process_batch(batch, optim)

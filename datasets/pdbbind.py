@@ -177,6 +177,7 @@ class PDBBind(Dataset):
         list_cplx = sorted(list(list_cplx))
         self.idx2cplx = {i: x for i, x in enumerate(list_cplx)}
         log('finish loading data into memory')
+        log('Total data: ', len(self.idx2cplx))
         self.cache = {}
 
     def __len__(self):
