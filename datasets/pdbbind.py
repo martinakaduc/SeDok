@@ -134,47 +134,69 @@ class PDBBind(Dataset):
         self.process()
 
         log('loading data into memory')
-        self.coords_dict = sorted(glob.glob(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt/*')))
-        self.lig_graphs = sorted(glob.glob(os.path.join(self.processed_dir, self.lig_graph_path) + "/*"))
-        self.rec_graphs = sorted(glob.glob(os.path.join(self.processed_dir, 'rec_graphs.pt/*')))
+
+        self.coords_dict = glob.glob(os.path.join(self.processed_dir, 'pocket_and_rec_coords.pt/*'))
+        self.coords_dict = {x.split('/')[-1]: x for x in self.coords_dict}
+        list_cplx = set(self.coords_dict.keys())
+        
+        self.lig_graphs = glob.glob(os.path.join(self.processed_dir, self.lig_graph_path) + "/*")
+        self.lig_graphs = {x.split('/')[-1]: x for x in self.lig_graphs}
+        list_cplx = list_cplx.intersection(set(self.lig_graphs.keys()))
+        
+        self.rec_graphs = glob.glob(os.path.join(self.processed_dir, 'rec_graphs.pt/*'))
+        self.rec_graphs = {x.split('/')[-1]: x for x in self.rec_graphs}
+        list_cplx = list_cplx.intersection(set(self.rec_graphs.keys()))
         
         if self.rec_subgraph:
-            self.rec_atom_subgraphs = sorted((glob.glob(os.path.join(self.processed_dir, self.rec_subgraph_path) + "/*")))
-        
+            self.rec_atom_subgraphs = glob.glob(os.path.join(self.processed_dir, self.rec_subgraph_path) + "/*")
+            self.rec_atom_subgraphs = {x.split('/')[-1]: x for x in self.rec_atom_subgraphs}
+            list_cplx = list_cplx.intersection(set(self.rec_atom_subgraphs.keys()))
+
         if self.lig_structure_graph:
-            self.lig_structure_graphs = sorted(glob.glob(os.path.join(self.processed_dir, 'lig_structure_graphs.pt/*')))
-            self.masks_angles = sorted(glob.glob(os.path.join(self.processed_dir, 'torsion_masks_and_angles.pt/*')))
-        
+            self.lig_structure_graphs = glob.glob(os.path.join(self.processed_dir, 'lig_structure_graphs.pt/*'))
+            self.masks_angles = glob.glob(os.path.join(self.processed_dir, 'torsion_masks_and_angles.pt/*'))
+            
+            self.lig_structure_graphs = {x.split('/')[-1]: x for x in self.lig_structure_graphs}
+            self.masks_angles = {x.split('/')[-1]: x for x in self.masks_angles}
+
+            list_cplx = list_cplx.intersection(set(self.lig_structure_graphs.keys()))
+
         if self.geometry_regularization:
             print(os.path.join(self.processed_dir, 'geometry_regularization.pt'))
-            self.geometry_graphs = sorted(glob.glob(os.path.join(self.processed_dir, 'geometry_regularization.pt/*')))
-        
+            self.geometry_graphs = glob.glob(os.path.join(self.processed_dir, 'geometry_regularization.pt/*'))
+            self.geometry_graphs = {x.split('/')[-1]: x for x in self.geometry_graphs}
+            list_cplx = list_cplx.intersection(set(self.geometry_graphs.keys()))
+
         if self.geometry_regularization_ring:
             print(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt'))
-            self.geometry_graphs = sorted(glob.glob(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt/*')))
+            self.geometry_graphs = glob.glob(os.path.join(self.processed_dir, 'geometry_regularization_ring.pt/*'))
+            self.geometry_graphs = {x.split('/')[-1]: x for x in self.geometry_graphs}
+            list_cplx = list_cplx.intersection(set(self.geometry_graphs.keys()))
 
         assert len(self.lig_graphs) == len(self.rec_graphs)
+        list_cplx = sorted(list(list_cplx))
+        self.idx2cplx = {i: x for i, x in enumerate(list_cplx)}
         log('finish loading data into memory')
         self.cache = {}
 
-
     def __len__(self):
-        return len(self.lig_graphs)
+        return len(self.idx2cplx)
 
     def __getitem__(self, idx):
-        coords_dict_loaded = torch.load(self.coords_dict[idx])
+        cplx = self.idx2cplx[idx]
+        coords_dict_loaded = torch.load(self.coords_dict[cplx])
         pocket_coords = coords_dict_loaded['pocket_coords']
 
         if self.lig_structure_graph:
-            lig_graph = load_graphs(self.lig_structure_graphs[idx])[0][0]
+            lig_graph = load_graphs(self.lig_structure_graphs[cplx])[0][0]
         else:
             if self.multiple_rdkit_conformers:
-                lig_graph = load_graphs(self.lig_graphs[idx])[0][self.conformer_id]
+                lig_graph = load_graphs(self.lig_graphs[cplx])[0][self.conformer_id]
             else:
-                lig_graph = load_graphs(self.lig_graphs[idx])[0][0]
+                lig_graph = load_graphs(self.lig_graphs[cplx])[0][0]
             
         lig_coords = lig_graph.ndata['x']
-        rec_graph = load_graphs(self.rec_graphs[idx])[0][0]
+        rec_graph = load_graphs(self.rec_graphs[cplx])[0][0]
 
         # Randomly rotate and (translate the ligand.
         rot_T, rot_b = random_rotation_translation(translation_distance=self.translation_distance)
@@ -188,21 +210,21 @@ class PDBBind(Dataset):
 
         if self.subgraph_augmentation and self.is_train_data:
             with torch.no_grad():
-                if idx in self.cache:
-                    max_distance, min_distance, distances = self.cache[idx]
+                if cplx in self.cache:
+                    max_distance, min_distance, distances = self.cache[cplx]
                 else:
                     lig_centroid = lig_graph.ndata['x'].mean(dim=0)
                     distances = torch.norm(rec_graph.ndata['x'] - lig_centroid, dim=1)
                     max_distance = torch.max(distances)
                     min_distance = torch.min(distances)
-                    self.cache[idx] = (min_distance.item(), max_distance.item(), distances)
+                    self.cache[cplx] = (min_distance.item(), max_distance.item(), distances)
                 radius = min_distance + self.min_shell_thickness + random.random() * abs((
                             max_distance - min_distance - self.min_shell_thickness))
                 rec_graph = dgl.node_subgraph(rec_graph, distances <= radius)
                 assert rec_graph.num_nodes() > 0
 
         if self.rec_subgraph:
-            rec_graph, _ = load_graphs(self.rec_atom_subgraphs[idx])
+            rec_graph, _ = load_graphs(self.rec_atom_subgraphs[cplx])
             if self.random_rec_atom_subgraph:
                 rot_T, rot_b = random_rotation_translation(translation_distance=2)
                 translated_lig_coords = lig_coords + rot_b
@@ -210,10 +232,10 @@ class PDBBind(Dataset):
                 rec_graph = dgl.node_subgraph(rec_graph, min_distances < self.random_rec_atom_subgraph_radius)
                 assert rec_graph.num_nodes() > 0
                 
-        geometry_graph = load_graphs(self.geometry_graphs[idx])[0][0] if self.geometry_regularization or self.geometry_regularization_ring else None
+        geometry_graph = load_graphs(self.geometry_graphs[cplx])[0][0] if self.geometry_regularization or self.geometry_regularization_ring else None
         
         if self.lig_structure_graph:
-            masks_angles_loaded = torch.load(self.masks_angles[idx])
+            masks_angles_loaded = torch.load(self.masks_angles[cplx])
             mask = masks_angles_loaded['mask']
             angle = masks_angles_loaded['angle']
 
