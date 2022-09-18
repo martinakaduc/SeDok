@@ -26,7 +26,7 @@ loss_params:
 train_names: 'data/timesplit_no_lig_overlap_train'
 val_names: 'data/timesplit_no_lig_overlap_val'
 test_names: 'data/timesplit_test'
-num_workers: 4
+num_workers: 0
 dataset_params:
   geometry_regularization_ring: True
   use_rdkit_coords: True #
