@@ -1,12 +1,12 @@
 name: equibind
 channels:
+  - pytorch
   - conda-forge
   - defaults
   - dglteam
-  - pytorch
 dependencies:
   - python=3.7
-  - pytorch 1.10
+  - pytorch=1.10.2
   - torchvision
   - cudatoolkit=10.2
   - torchaudio
