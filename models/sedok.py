@@ -220,7 +220,7 @@ class ISET_Layer(nn.Module):
             geometry_reg_step_size=0.1,
             lig_no_softmax=False,
             rec_no_softmax=False,
-            multihop_strategy=None
+            nhop=None
     ):
 
         super(ISET_Layer, self).__init__()
@@ -252,7 +252,7 @@ class ISET_Layer(nn.Module):
         self.save_trajectories = save_trajectories
         self.lig_no_softmax = lig_no_softmax
         self.rec_no_softmax = rec_no_softmax
-        self.multihop_strategy = multihop_strategy
+        self.nhop = nhop
 
         # EDGES
         lig_edge_mlp_input_dim = (h_feats_dim * 2) + lig_input_edge_feats_dim
@@ -436,6 +436,12 @@ class ISET_Layer(nn.Module):
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Linear(h_feats_dim, 1),
             )
+        
+        # self.zero = torch.zeros(1).to(self.device)
+        # if self.nhop:
+        #     self.W_lig_local_attn = nn.Parameter(torch.zeros(size=(out_feats_dim, out_feats_dim)))
+        #     self.W_rec_local_attn = nn.Parameter(torch.zeros(size=(out_feats_dim, out_feats_dim)))
+        #     self.gate = nn.Linear(out_feats_dim * 2, 1)
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -535,8 +541,25 @@ class ISET_Layer(nn.Module):
             else:
                 x_evolved_rec = coords_rec
 
-            lig_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
-            rec_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
+            if not self.nhop:
+                lig_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
+                rec_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'))
+            else:
+                for idx in range(self.nhop):
+                    if idx == 0:
+                        lig_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'msg'+str(idx)))
+                        rec_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'msg'+str(idx)))
+                    else:
+                        def copy_n2e(edge):
+                            return {'msg'+str(idx-1): edge.src['msg'+str(idx-1)]}
+                        lig_graph.apply_edges(copy_n2e)
+                        rec_graph.apply_edges(copy_n2e)
+
+                        lig_graph.update_all(fn.copy_edge('msg'+str(idx-1), 'm'), fn.mean('m', 'msg'+str(idx)))
+                        rec_graph.update_all(fn.copy_edge('msg'+str(idx-1), 'm'), fn.mean('m', 'msg'+str(idx)))
+                
+                lig_graph.ndata['aggr_msg'] = lig_graph.ndata['msg'+str(self.nhop-1)]
+                rec_graph.ndata['aggr_msg'] = rec_graph.ndata['msg'+str(self.nhop-1)]
 
             if self.fine_tune:
                 x_evolved_lig = x_evolved_lig + self.att_mlp_cross_coors_V_lig(h_feats_lig) * (
@@ -590,36 +613,46 @@ class ISET_Layer(nn.Module):
                                                  cross_attention_rec_feat,
                                                  original_receptor_node_features), dim=-1)
 
-            if not self.multihop_strategy:
-                # Skip connections 1-hop
-                if self.h_feats_dim == self.out_feats_dim:
-                    node_upd_ligand = self.skip_weight_h * self.node_mlp_lig(input_node_upd_ligand) + (
-                            1. - self.skip_weight_h) * h_feats_lig
-                    node_upd_receptor = self.skip_weight_h * self.node_mlp(input_node_upd_receptor) + (
-                            1. - self.skip_weight_h) * h_feats_rec
-                else:
-                    node_upd_ligand = self.node_mlp_lig(input_node_upd_ligand)
-                    node_upd_receptor = self.node_mlp(input_node_upd_receptor)
+            # Skip connections 1-hop
+            if self.h_feats_dim == self.out_feats_dim:
+                node_upd_ligand = self.skip_weight_h * self.node_mlp_lig(input_node_upd_ligand) + (
+                        1. - self.skip_weight_h) * h_feats_lig
+                node_upd_receptor = self.skip_weight_h * self.node_mlp(input_node_upd_receptor) + (
+                        1. - self.skip_weight_h) * h_feats_rec
             else:
-                # Multi-hop
                 node_upd_ligand = self.node_mlp_lig(input_node_upd_ligand)
                 node_upd_receptor = self.node_mlp(input_node_upd_receptor)
-                
-                # e = torch.einsum('ijl,ikl->ijk', (torch.matmul(node_upd_ligand, self.A), node_upd_ligand))
-                # e = e + e.permute((0,2,1))
 
-                # lig_graph.apply_edges(self.local_attn_lig)  ## i->j edge:  [h_i h_j]
-                # rec_graph.apply_edges(self.local_attn_rec) # get feature cura node va tin htoan
+            # Multi-hop
+            # node_upd_ligand = self.node_mlp_lig(input_node_upd_ligand)
+            # node_upd_receptor = self.node_mlp(input_node_upd_receptor)
 
-                # local_attention = torch.where(adj > 0, e, self.zeros)
-                # local_attention = torch.softmax(local_attention, dim=1)
+            # if self.h_feats_dim == self.out_feats_dim:
+            #     lig_e = torch.einsum('jl,kl->jk', (torch.matmul(node_upd_ligand, self.W_lig_local_attn), node_upd_ligand))
+            #     lig_e = lig_e + lig_e.T
 
-                # z = node_upd_ligand
-                # for _ in range(self.nhop):
-                #     az = torch.relu(torch.einsum('aij,ajk->aik',(local_attention, z)))
-                #     coeff = torch.sigmoid(self.gate(torch.cat([h, az], -1))).repeat(1, 1, h.size(-1))
-                #     z = coeff * node_upd_ligand + (1 - coeff) * az
+            #     lig_adj = torch.eye(lig_graph.number_of_nodes()).to(self.device) + lig_graph.adj(ctx=self.device)
+            #     lig_local_attention = torch.where(lig_adj > 0, lig_e, self.zero)
+            #     lig_local_attention = torch.softmax(lig_local_attention, dim=1)
 
+            #     # lig_z = node_upd_ligand
+            #     for _ in range(self.nhop):
+            #         lig_az = torch.relu(torch.einsum('ij,jk->ik',(lig_local_attention, node_upd_ligand)))
+            #         lig_coeff = torch.sigmoid(self.gate(torch.cat([h_feats_lig, lig_az], -1)))
+            #         node_upd_ligand = lig_coeff * h_feats_lig + (1 - lig_coeff) * lig_az
+
+            #     rec_e = torch.einsum('jl,kl->jk', (torch.matmul(node_upd_receptor, self.W_rec_local_attn), node_upd_receptor))
+            #     rec_e = rec_e + rec_e.T
+
+            #     rec_adj = torch.eye(rec_graph.number_of_nodes()).to(self.device) + rec_graph.adj(ctx=self.device)
+            #     rec_local_attention = torch.where(rec_adj > 0, rec_e, self.zero)
+            #     rec_local_attention = torch.softmax(rec_local_attention, dim=1)
+
+            #     # rec_z = node_upd_receptor
+            #     for _ in range(self.nhop):
+            #         rec_az = torch.relu(torch.einsum('ij,jk->ik',(rec_local_attention, node_upd_receptor)))
+            #         rec_coeff = torch.sigmoid(self.gate(torch.cat([h_feats_rec, rec_az], -1)))
+            #         node_upd_receptor = rec_coeff * h_feats_rec + (1 - rec_coeff) * rec_az
 
             if self.debug:
                 log('node_mlp params')
@@ -666,7 +699,7 @@ class ISET(nn.Module):
                  unnormalized_rotation_weights=False, centroid_keypts_construction_rec=False,
                  centroid_keypts_construction_lig=False, rec_no_softmax=False, lig_no_softmax=False,
                  normalize_Z_rec_directions=False,
-                 centroid_keypts_construction=False, evolve_only=False, separate_lig=False, save_trajectories=False, **kwargs):
+                 centroid_keypts_construction=False, evolve_only=False, separate_lig=False, save_trajectories=False, multihop_strategy=None, **kwargs):
         super(ISET, self).__init__()
         self.debug = debug
         self.cross_msgs = cross_msgs
@@ -691,6 +724,10 @@ class ISET(nn.Module):
         self.lig_no_softmax = lig_no_softmax
         self.evolve_only = evolve_only
         self.locknkey = locknkey
+        if multihop_strategy:
+            self.multihop_strategy = multihop_strategy
+        else:
+            self.multihop_strategy = [None] * n_lays
 
         assert self.locknkey in ["direct", "indirect"]
 
@@ -722,7 +759,8 @@ class ISET(nn.Module):
                         debug=debug,
                         device=device,
                         dropout=dropout,
-                        save_trajectories=save_trajectories,**kwargs))
+                        save_trajectories=save_trajectories,
+                        nhop=self.multihop_strategy[0], **kwargs))
 
         if shared_layers:
             interm_lay = ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
@@ -734,7 +772,8 @@ class ISET(nn.Module):
                                      debug=debug,
                                      device=device,
                                      dropout=dropout,
-                                     save_trajectories=save_trajectories,**kwargs)
+                                     save_trajectories=save_trajectories,
+                                     nhop=self.multihop_strategy[0], **kwargs)
             for layer_idx in range(1, n_lays):
                 self.iset_layers.append(interm_lay)
         else:
@@ -750,7 +789,8 @@ class ISET(nn.Module):
                                 debug=debug_this_layer,
                                 device=device,
                                 dropout=dropout,
-                                save_trajectories=save_trajectories,**kwargs))
+                                save_trajectories=save_trajectories,
+                                nhop=self.multihop_strategy[layer_idx], **kwargs))
         if self.separate_lig:
             self.iset_layers_separate = nn.ModuleList()
             self.iset_layers_separate.append(
@@ -763,7 +803,8 @@ class ISET(nn.Module):
                             debug=debug,
                             device=device,
                             dropout=dropout,
-                            save_trajectories=save_trajectories,**kwargs))
+                            save_trajectories=save_trajectories,
+                            nhop=self.multihop_strategy[0], **kwargs))
 
             if shared_layers:
                 interm_lay = ISET_Layer(orig_h_feats_dim=input_node_feats_dim,
@@ -775,7 +816,8 @@ class ISET(nn.Module):
                                          debug=debug,
                                          device=device,
                                          dropout=dropout,
-                                         save_trajectories=save_trajectories,**kwargs)
+                                         save_trajectories=save_trajectories,
+                                         nhop=self.multihop_strategy[0], **kwargs)
                 for layer_idx in range(1, n_lays):
                     self.iset_layers_separate.append(interm_lay)
             else:
@@ -791,7 +833,8 @@ class ISET(nn.Module):
                                     debug=debug_this_layer,
                                     device=device,
                                     dropout=dropout,
-                                    save_trajectories=save_trajectories,**kwargs))
+                                    save_trajectories=save_trajectories,
+                                    nhop=self.multihop_strategy[layer_idx], **kwargs))
         # Attention layers
         self.num_att_heads = num_att_heads
         self.out_feats_dim = lay_hid_dim

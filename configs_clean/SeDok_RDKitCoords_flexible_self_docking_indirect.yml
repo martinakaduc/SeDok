@@ -4,7 +4,7 @@ data_seed: 1
 
 trainer: binding
 num_epochs: 1000000
-batch_size: 8
+batch_size: 64
 log_iterations: 100
 patience: 150
 num_train:  # leave empty to use all (in param train_names below)
@@ -116,7 +116,7 @@ model_parameters:
   residue_emb_dim: 64
   lay_hid_dim: 64
   multihop_strategy:
-  locknkey: "direct"
+  locknkey: "indirect"
   num_att_heads: 0
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']
