@@ -11,12 +11,12 @@ class BindingTrainer(Trainer):
     def forward_pass(self, batch):
         lig_graphs, rec_graphs, ligs_coords, recs_coords, ligs_pocket_coords, recs_pocket_coords, geometry_graphs, complex_names = tuple(
             batch)
-        ligs_coords_pred, ligs_keypts, recs_keypts, rotations, translations, geom_reg_loss = self.model(lig_graphs, rec_graphs, geometry_graphs,
+        ligs_coords_pred, ligs_keypts, recs_keypts, rotations, translations, geom_reg_loss, base_loss = self.model(lig_graphs, rec_graphs, geometry_graphs,
                                                                                          complex_names=complex_names,
                                                                                          epoch=self.epoch)
         loss, loss_components = self.loss_func(ligs_coords, recs_coords, ligs_coords_pred, ligs_pocket_coords,
                                                recs_pocket_coords, ligs_keypts, recs_keypts, rotations, translations, geom_reg_loss,
-                                               self.device)
+                                               base_loss, self.device)
         return loss, loss_components, ligs_coords_pred, ligs_coords
 
     def after_batch(self, ligs_coords_pred, ligs_coords, batch_indices):

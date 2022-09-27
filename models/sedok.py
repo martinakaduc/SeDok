@@ -7,6 +7,7 @@ from turtle import forward
 import dgl
 import torch
 from torch import nn
+from torch.distributions.uniform import Uniform
 from dgl import function as fn
 
 from commons.process_mols import AtomEncoder, rec_atom_feature_dims, rec_residue_feature_dims, lig_feature_dims
@@ -51,11 +52,17 @@ def normalize(v):
     return v / torch.linalg.norm(v)
 
 
-def find_additional_vertical_vector(vector, device):
-    ez = torch.FloatTensor([0, 0, 1]).to(device)
+def find_additional_vertical_vector(vector, ez=None, device='cpu'):
     look_at_vector = normalize(vector)
+
+    # ez = torch.FloatTensor([0, 0, 1]).to(device)
+    if ez == None:
+        ez = normalize(Uniform(-1,1).sample((3,)).to(device))
+        if torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-03):
+            ez = normalize(Uniform(-1,1).sample((3,)).to(device))
+
     up_vector = normalize(ez - torch.dot(look_at_vector, ez) * look_at_vector)
-    return up_vector
+    return up_vector, ez
 
 
 def calc_rotation_matrix(v1_start, v2_start, v1_target, v2_target):
@@ -82,22 +89,23 @@ def calc_rotation_matrix(v1_start, v2_start, v1_target, v2_target):
     def calc_base_transition_matrix(U, V):
         return V@torch.linalg.inv(U)
 
-    # if not torch.isclose(torch.dot(v1_target, v2_target), torch.zeros(1), atol=1e-03):
-    #     raise ValueError("v1_target and v2_target must be vertical")
-
     U, V = get_base_matrices()
     return calc_base_transition_matrix(U, V)
 
 
-def get_rotation_matrix(start_look_at_vector, target_look_at_vector, start_up_vector=None, target_up_vector=None, device='cpu'):
+def get_rotation_matrix(start_look_at_vector, target_look_at_vector, reference_vector=None, start_up_vector=None, target_up_vector=None, device='cpu'):
+    # if reference_vector is None:
+    #     reference_vector = Uniform(-1,1).sample((3,)).to(device)
+    start_ez = target_ez = torch.zeros(1).to(device)
+
     if start_up_vector is None:
-        start_up_vector = find_additional_vertical_vector(start_look_at_vector, device)
+        start_up_vector, start_ez = find_additional_vertical_vector(start_look_at_vector, ez=reference_vector, device=device)
 
     if target_up_vector is None:
-        target_up_vector = find_additional_vertical_vector(target_look_at_vector, device)
+        target_up_vector, target_ez = find_additional_vertical_vector(target_look_at_vector, ez=reference_vector, device=device)
 
     rot_mat = calc_rotation_matrix(start_look_at_vector, start_up_vector, target_look_at_vector, target_up_vector)
-    return rot_mat
+    return rot_mat, abs(start_look_at_vector@start_ez.T) + abs(target_look_at_vector@target_ez.T)
 
 
 def get_non_lin(type, negative_slope):
@@ -170,6 +178,9 @@ def get_mask(ligand_batch_num_nodes, receptor_batch_num_nodes, device):
         partial_r = partial_r + r_n
     return mask
 
+def get_base_loss(base):
+    u1, u2, u3 = base
+    return abs(u1 @ u2.T) + abs(u2 @ u3.T) + abs(u3 @ u1.T)
 
 class CoordsNorm(nn.Module):
     def __init__(self, eps=1e-8, scale_init=1.):
@@ -478,10 +489,18 @@ class ISET_Layer(nn.Module):
         x_rel = self.lig_coords_norm(edges.data['x_rel']) if self.normalize_coordinate_update else edges.data['x_rel']
         return {'m': x_rel * edge_coef_ligand}  # (x_i - x_j) * \phi^x(m_{i->j})
 
+    def update_x_moment_lig_multihop(self, edges):    
+        edge_coef_ligand = torch.sigmoid(self.coords_mlp_lig(edges.data['msg']))  # \phi^x(m_{i->j})
+        return {'m': edges.src['x_now'] * edge_coef_ligand}  # (x_i - x_j) * \phi^x(m_{i->j})
+
     def update_x_moment_rec(self, edges):
         edge_coef_rec = self.coords_mlp_rec(edges.data['msg'])  # \phi^x(m_{i->j})
         x_rel = self.rec_coords_norm(edges.data['x_rel']) if self.normalize_coordinate_update else edges.data['x_rel']
         return {'m': x_rel * edge_coef_rec}  # (x_i - x_j) * \phi^x(m_{i->j})
+    
+    def update_x_moment_rec_multihop(self, edges):
+        edge_coef_rec = torch.sigmoid(self.coords_mlp_rec(edges.data['msg']))  # \phi^x(m_{i->j})
+        return {'m': edges.src['x_now'] * edge_coef_rec}  # (x_i - x_j) * \phi^x(m_{i->j})
 
     def forward(self, lig_graph, rec_graph, coords_lig, h_feats_lig, original_ligand_node_features, orig_coords_lig,
                 coords_rec, h_feats_rec, original_receptor_node_features, orig_coords_rec, mask, geometry_graph):
@@ -527,17 +546,33 @@ class ISET_Layer(nn.Module):
                 log(torch.max(cross_attention_lig_feat.abs()), 'aggr_cross_msg(i) = sum_j a_{i,j} * h_j')
 
             if self.lig_evolve:
-                lig_graph.update_all(self.update_x_moment_lig, fn.mean('m', 'x_update'))
                 # Inspired by https://arxiv.org/pdf/2108.10521.pdf we use original X and not only graph.ndata['x_now']
-                x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * \
-                                lig_graph.ndata['x_now'] + lig_graph.ndata['x_update']
+                if not self.nhop:
+                    lig_graph.update_all(self.update_x_moment_lig, fn.mean('m', 'x_update'))
+                    x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * \
+                                    (lig_graph.ndata['x_now']) + lig_graph.ndata['x_update']
+                else:
+                    lig_graph.update_all(self.update_x_moment_lig_multihop, fn.mean('m', 'x_update'))
+                    x_evolved_lig = lig_graph.ndata['x_update']
+                    for idx in range(self.nhop):
+                        x_evolved_lig = self.x_connection_init * lig_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_lig
+                    x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * x_evolved_lig
+                                    
             else:
                 x_evolved_lig = coords_lig
 
             if self.rec_evolve:
-                rec_graph.update_all(self.update_x_moment_rec, fn.mean('m', 'x_update'))
-                x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * \
-                                rec_graph.ndata['x_now'] + rec_graph.ndata['x_update']
+                if not self.nhop:
+                    rec_graph.update_all(self.update_x_moment_rec, fn.mean('m', 'x_update'))
+                    x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * \
+                                    (rec_graph.ndata['x_now']) + rec_graph.ndata['x_update']
+                else:
+                    rec_graph.update_all(self.update_x_moment_rec_multihop, fn.mean('m', 'x_update'))
+                    x_evolved_rec = rec_graph.ndata['x_update']
+                    for idx in range(self.nhop):
+                        x_evolved_rec = self.x_connection_init * rec_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_rec
+                    x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * x_evolved_rec
+
             else:
                 x_evolved_rec = coords_rec
 
@@ -729,7 +764,7 @@ class ISET(nn.Module):
         else:
             self.multihop_strategy = [None] * n_lays
 
-        assert self.locknkey in ["direct", "indirect"]
+        assert self.locknkey in ["direct_base", "direct", "indirect"]
 
         self.lig_atom_embedder = AtomEncoder(emb_dim=residue_emb_dim - self.random_vec_dim,
                                              feature_dims=lig_feature_dims, use_scalar_feat=use_scalar_features,
@@ -836,7 +871,6 @@ class ISET(nn.Module):
                                     save_trajectories=save_trajectories,
                                     nhop=self.multihop_strategy[layer_idx], **kwargs))
         # Attention layers
-        self.num_att_heads = num_att_heads
         self.out_feats_dim = lay_hid_dim
         # self.reset_parameters()
 
@@ -869,27 +903,29 @@ class ISET(nn.Module):
         self.keypts_queries_rec_trans = nn.Sequential(
             nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
 
+        if (self.locknkey == "direct") or (self.locknkey == "indirect"):
+            self.num_att_heads = 1
+        elif self.locknkey == "direct_base":
+            self.num_att_heads = 2
+        else:
+            self.num_att_heads = num_att_heads
+
         self.keypts_attention_rec_rot = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+            nn.Linear(self.out_feats_dim, self.out_feats_dim*self.num_att_heads, bias=False))
 
         self.keypts_queries_rec_rot = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
-
-        self.keypts_attention_lig_fixed = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
-
-        self.keypts_queries_lig_fixed = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+            nn.Linear(self.out_feats_dim, self.out_feats_dim*self.num_att_heads, bias=False))
 
         self.keypts_attention_lig_rot = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+            nn.Linear(self.out_feats_dim, self.out_feats_dim*self.num_att_heads, bias=False))
 
         self.keypts_queries_lig_rot = nn.Sequential(
-            nn.Linear(self.out_feats_dim, self.out_feats_dim, bias=False))
+            nn.Linear(self.out_feats_dim, self.out_feats_dim*self.num_att_heads, bias=False))
 
-        self.xy_mask = torch.Tensor([1, 1, 0]).to(self.device)
-        self.yz_mask = torch.Tensor([0, 1, 1]).to(self.device)
-        self.zx_mask = torch.Tensor([1, 0, 1]).to(self.device)
+        if self.locknkey == "indirect":
+            self.xy_mask = torch.Tensor([1, 1, 0]).to(self.device)
+            self.yz_mask = torch.Tensor([0, 1, 1]).to(self.device)
+            self.zx_mask = torch.Tensor([1, 0, 1]).to(self.device)
 
     def forward(self, lig_graph, rec_graph, geometry_graph, complex_names, epoch):
         orig_coords_lig = lig_graph.ndata['new_x']
@@ -1011,6 +1047,8 @@ class ISET(nn.Module):
 
         rotations = []
         translations = []
+        base_loss = 0
+
         ligs_evolved = []
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
         ligs_node_idx.insert(0, 0)
@@ -1056,26 +1094,25 @@ class ISET(nn.Module):
             
             # lig_fixed_vec = self.feat_2_coord(attn_lig_fixed @ node_upd_per_ligand)
 
-            attn_lig_rot = (self.keypts_attention_lig_rot(node_upd_per_ligand).view(-1, 1, d).transpose(0, 1) @
-                            self.keypts_queries_lig_rot(rec_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
-                            math.sqrt(d)).view(1, -1)
+            attn_lig_rot = (self.keypts_attention_lig_rot(node_upd_per_ligand).view(-1, self.num_att_heads, d).transpose(0, 1) @
+                            self.keypts_queries_lig_rot(rec_feats_mean).view(1, self.num_att_heads, d).transpose(0,1).transpose(1, 2) /
+                            math.sqrt(d)).view(self.num_att_heads, -1)
 
             if not self.lig_no_softmax:
                 attn_lig_rot = torch.softmax(attn_lig_rot, dim=1)
 
             lig_rot_vec = attn_lig_rot @ x_evolved_per_lig - lig_centroid
-            lig_rot_vec = lig_rot_vec / torch.linalg.norm(lig_rot_vec)
-            lig_fixed_vec = lig_rot_vec
+            lig_rot_vec = (lig_rot_vec.T / torch.linalg.vector_norm(lig_rot_vec, dim=1)).T
 
-            attn_rec_rot = (self.keypts_attention_rec_rot(node_upd_per_receptor).view(-1, 1, d).transpose(0, 1) @
-                            self.keypts_queries_rec_rot(lig_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
-                            math.sqrt(d)).view(1, -1)
+            attn_rec_rot = (self.keypts_attention_rec_rot(node_upd_per_receptor).view(-1, self.num_att_heads, d).transpose(0, 1) @
+                            self.keypts_queries_rec_rot(lig_feats_mean).view(1, self.num_att_heads, d).transpose(0,1).transpose(1, 2) /
+                            math.sqrt(d)).view(self.num_att_heads, -1)
 
             if not self.rec_no_softmax:
                 attn_rec_rot = torch.softmax(attn_rec_rot, dim=1)
 
             rec_rot_vec = rec_centroid - attn_rec_rot @ x_evolved_per_rec
-            rec_rot_vec = rec_rot_vec / torch.linalg.norm(rec_rot_vec)
+            rec_rot_vec = (rec_rot_vec.T / torch.linalg.vector_norm(rec_rot_vec, dim=1)).T
 
             # Ver 1
             # rotation_matrix = self.W_feature(node_upd_per_receptor) @ node_upd_per_ligand.T + \
@@ -1086,13 +1123,25 @@ class ISET(nn.Module):
 
             if self.locknkey == "direct":
                 # Ver 2: Directly
-                rotation_matrix = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], device=self.device)
+                rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], device=self.device)
+                base_loss += b_l
+
+            elif self.locknkey == "direct_base":
+                # rotation_matrix = rec_rot_vec.T @ torch.linalg.inv(lig_rot_vec.T)
+                # base_loss += get_base_loss(rec_rot_vec) + get_base_loss(lig_rot_vec)
+
+                reference_vector = normalize(lig_rot_vec[1] + rec_rot_vec[1])
+                rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=reference_vector, device=self.device)
+                base_loss += b_l
+
+                # rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=[lig_rot_vec[1], rec_rot_vec[1]], device=self.device)
+                # base_loss += b_l
 
             elif self.locknkey == "indirect":
                 # Ver 3: Indirectly
-                lig_fixed_vec_xy = lig_fixed_vec * self.xy_mask
-                lig_fixed_vec_yz = lig_fixed_vec * self.yz_mask
-                lig_fixed_vec_zx = lig_fixed_vec * self.zx_mask
+                lig_rot_vec_xy = lig_rot_vec * self.xy_mask
+                lig_rot_vec_yz = lig_rot_vec * self.yz_mask
+                lig_rot_vec_zx = lig_rot_vec * self.zx_mask
 
                 rec_rot_vec_xy = rec_rot_vec * self.xy_mask
                 rec_rot_vec_yz = rec_rot_vec * self.yz_mask
@@ -1102,14 +1151,14 @@ class ISET(nn.Module):
                 # v2: [x2; y2]: rec_rot
                 # atan2(x1*y2 - y1*x2; x1*x2 + y1*y2)
                 
-                alpha = torch.atan2(lig_fixed_vec_xy[:,0] * rec_rot_vec_xy[:,1] - lig_fixed_vec_xy[:,1] * rec_rot_vec_xy[:,0],
-                                    lig_fixed_vec_xy[:,0] * rec_rot_vec_xy[:,0] + lig_fixed_vec_xy[:,1] * rec_rot_vec_xy[:,1])
+                alpha = torch.atan2(lig_rot_vec_xy[:,0] * rec_rot_vec_xy[:,1] - lig_rot_vec_xy[:,1] * rec_rot_vec_xy[:,0],
+                                    lig_rot_vec_xy[:,0] * rec_rot_vec_xy[:,0] + lig_rot_vec_xy[:,1] * rec_rot_vec_xy[:,1])
 
-                beta = torch.atan2(lig_fixed_vec_zx[:,0] * rec_rot_vec_zx[:,1] - lig_fixed_vec_zx[:,1] * rec_rot_vec_zx[:,0],
-                                    lig_fixed_vec_zx[:,0] * rec_rot_vec_zx[:,0] + lig_fixed_vec_zx[:,1] * rec_rot_vec_zx[:,1])
+                beta = torch.atan2(lig_rot_vec_zx[:,0] * rec_rot_vec_zx[:,1] - lig_rot_vec_zx[:,1] * rec_rot_vec_zx[:,0],
+                                    lig_rot_vec_zx[:,0] * rec_rot_vec_zx[:,0] + lig_rot_vec_zx[:,1] * rec_rot_vec_zx[:,1])
 
-                gamma = torch.atan2(lig_fixed_vec_yz[:,0] * rec_rot_vec_yz[:,1] - lig_fixed_vec_yz[:,1] * rec_rot_vec_yz[:,0],
-                                    lig_fixed_vec_yz[:,0] * rec_rot_vec_yz[:,0] + lig_fixed_vec_yz[:,1] * rec_rot_vec_yz[:,1])
+                gamma = torch.atan2(lig_rot_vec_yz[:,0] * rec_rot_vec_yz[:,1] - lig_rot_vec_yz[:,1] * rec_rot_vec_yz[:,0],
+                                    lig_rot_vec_yz[:,0] * rec_rot_vec_yz[:,0] + lig_rot_vec_yz[:,1] * rec_rot_vec_yz[:,1])
 
                 R_z = torch.FloatTensor([[0, 0, 0], [0, 0, 0], [0, 0, 1]]).to(self.device)
                 R_y = torch.FloatTensor([[0, 0, 0], [0, 1, 0], [0, 0, 0]]).to(self.device)
@@ -1159,7 +1208,7 @@ class ISET(nn.Module):
             rotations.append(rotation_matrix)
             translations.append(translation_vector)
 
-        return [rotations, translations, ligs_evolved, geom_losses]
+        return [rotations, translations, ligs_evolved, geom_losses, base_loss]
 
     def __repr__(self):
         return "ISET " + str(self.__dict__)
@@ -1210,7 +1259,7 @@ class SeDok(nn.Module):
                     predicted_coords.mean(dim=0) - lig_graph.ndata['x'].mean(dim=0), '\n')
             predicted_ligs_coords_list.append(predicted_coords)
         #torch.save({'predictions': predicted_ligs_coords_list, 'names': complex_names})
-        return predicted_ligs_coords_list, None, None, outputs[0], outputs[1], outputs[3]
+        return predicted_ligs_coords_list, None, None, outputs[0], outputs[1], outputs[3], outputs[4]
 
     def __repr__(self):
         return "SeDok " + str(self.__dict__)

@@ -21,6 +21,7 @@ loss_params:
   translated_lig_kpt_ot_loss: False
   kabsch_rmsd_weight: 0
   orthogonal_rotation_weight: 1
+  base_loss_weight: 1
 
 
 train_names: 'data/timesplit_no_lig_overlap_train'
@@ -115,8 +116,8 @@ model_parameters:
   use_mean_node_features: True
   residue_emb_dim: 64
   lay_hid_dim: 64
-  multihop_strategy:
-  locknkey: "indirect"
+  multihop_strategy: [1, 2, 3, 4]
+  locknkey: "direct_base"
   num_att_heads: 0
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']

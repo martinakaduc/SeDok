@@ -74,8 +74,8 @@ main_metric_goal: 'max'
 optimizer: Adam
 optimizer_params:
   lr: 1.0e-4
-  weight_decay: 1.0e-4 # 1.0e-5 in good run
-clip_grad: 100 # leave empty for no grad clip
+  weight_decay: 1.0e-5 # 1.0e-5 in good run
+clip_grad: 50 # leave empty for no grad clip
 
 scheduler_step_per_batch: False
 lr_scheduler:  ReduceLROnPlateau # leave empty to use none

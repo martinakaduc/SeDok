@@ -21,6 +21,7 @@ loss_params:
   translated_lig_kpt_ot_loss: False
   kabsch_rmsd_weight: 0
   orthogonal_rotation_weight: 1
+  base_loss_weight: 1
 
 
 train_names: 'data/timesplit_no_lig_overlap_train'
@@ -75,7 +76,7 @@ optimizer: Adam
 optimizer_params:
   lr: 1.0e-4
   weight_decay: 1.0e-5 # 1.0e-5 in good run
-clip_grad: 50 # leave empty for no grad clip
+clip_grad: 75 # leave empty for no grad clip
 
 scheduler_step_per_batch: False
 lr_scheduler:  ReduceLROnPlateau # leave empty to use none
@@ -116,7 +117,7 @@ model_parameters:
   residue_emb_dim: 64
   lay_hid_dim: 64
   multihop_strategy:
-  locknkey: "indirect"
+  locknkey: "direct_base"
   num_att_heads: 0
   dropout: 0.1
   nonlin: 'lkyrelu' # ['swish', 'lkyrelu']
