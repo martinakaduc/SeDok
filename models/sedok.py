@@ -56,7 +56,7 @@ def find_additional_vertical_vector(vector, ez=None, device='cpu'):
     look_at_vector = normalize(vector)
 
     # ez = torch.FloatTensor([0, 0, 1]).to(device)
-    if ez == None:
+    if ez is None:
         ez = normalize(Uniform(-1,1).sample((3,)).to(device))
         if torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-03):
             ez = normalize(Uniform(-1,1).sample((3,)).to(device))
@@ -502,6 +502,17 @@ class ISET_Layer(nn.Module):
         edge_coef_rec = torch.sigmoid(self.coords_mlp_rec(edges.data['msg']))  # \phi^x(m_{i->j})
         return {'m': edges.src['x_now'] * edge_coef_rec}  # (x_i - x_j) * \phi^x(m_{i->j})
 
+    def msg_x_with_e(self, edges):
+        return {'z': edges.src['x_update'], 'e': edges.data['coord_attn']}
+
+    def reduce_x_by_neighbors(self, nodes):
+        alpha = torch.softmax(nodes.mailbox['e'], dim=1)
+        h = torch.sum(alpha * nodes.mailbox['z'], dim=1)
+        return {'x_aggre': h}
+
+    def add_x_aggre(self, nodes):
+        return {'x_update': self.x_connection_init * nodes.data['x_now'] + (1. - self.x_connection_init) * nodes.data['x_aggre']}
+
     def forward(self, lig_graph, rec_graph, coords_lig, h_feats_lig, original_ligand_node_features, orig_coords_lig,
                 coords_rec, h_feats_rec, original_receptor_node_features, orig_coords_rec, mask, geometry_graph):
         with lig_graph.local_scope() and rec_graph.local_scope():
@@ -552,12 +563,17 @@ class ISET_Layer(nn.Module):
                     x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * \
                                     (lig_graph.ndata['x_now']) + lig_graph.ndata['x_update']
                 else:
-                    lig_graph.update_all(self.update_x_moment_lig_multihop, fn.mean('m', 'x_update'))
-                    x_evolved_lig = lig_graph.ndata['x_update']
+                    # lig_graph.update_all(self.update_x_moment_lig_multihop, fn.mean('m', 'x_update'))
+                    # x_evolved_lig = lig_graph.ndata['x_update']
+                    # for idx in range(self.nhop):
+                    #     x_evolved_lig = self.x_connection_init * lig_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_lig
+                    # x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * x_evolved_lig
+                    
+                    lig_graph.apply_edges(lambda x: {"coord_attn": nn.functional.leaky_relu(self.coords_mlp_lig(x.data['msg']))})
+                    lig_graph.apply_nodes(lambda nodes: {'x_update' : nodes.data['x_now']})
                     for idx in range(self.nhop):
-                        x_evolved_lig = self.x_connection_init * lig_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_lig
-                    x_evolved_lig = self.x_connection_init * orig_coords_lig + (1. - self.x_connection_init) * x_evolved_lig
-                                    
+                        lig_graph.update_all(self.msg_x_with_e, self.reduce_x_by_neighbors, self.add_x_aggre)
+                    x_evolved_lig = lig_graph.ndata['x_update']
             else:
                 x_evolved_lig = coords_lig
 
@@ -567,12 +583,17 @@ class ISET_Layer(nn.Module):
                     x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * \
                                     (rec_graph.ndata['x_now']) + rec_graph.ndata['x_update']
                 else:
-                    rec_graph.update_all(self.update_x_moment_rec_multihop, fn.mean('m', 'x_update'))
-                    x_evolved_rec = rec_graph.ndata['x_update']
+                    # rec_graph.update_all(self.update_x_moment_rec_multihop, fn.mean('m', 'x_update'))
+                    # x_evolved_rec = rec_graph.ndata['x_update']
+                    # for idx in range(self.nhop):
+                    #     x_evolved_rec = self.x_connection_init * rec_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_rec
+                    # x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * x_evolved_rec
+                    
+                    rec_graph.apply_edges(lambda x: {"coord_attn": nn.functional.leaky_relu(self.coords_mlp_rec(x.data['msg']))})
+                    rec_graph.apply_nodes(lambda nodes: {'x_update' : nodes.data['x_now']})
                     for idx in range(self.nhop):
-                        x_evolved_rec = self.x_connection_init * rec_graph.ndata['x_now'] + (1. - self.x_connection_init) * x_evolved_rec
-                    x_evolved_rec = self.x_connection_init * orig_coords_rec + (1. - self.x_connection_init) * x_evolved_rec
-
+                        rec_graph.update_all(self.msg_x_with_e, self.reduce_x_by_neighbors, self.add_x_aggre)
+                    x_evolved_rec = rec_graph.ndata['x_update']
             else:
                 x_evolved_rec = coords_rec
 
