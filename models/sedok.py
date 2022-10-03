@@ -59,8 +59,8 @@ def find_additional_vertical_vector(vector, ez=None, device='cpu'):
     if ez is None:
         ez = normalize(Uniform(-1,1).sample((3,)).to(device))
 
-    while torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-03):
-        ez = normalize(ez+Uniform(-1,1).sample((3,)).to(device))
+    while torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-2):
+        ez = normalize(Uniform(-1,1).sample((3,)).to(device))
 
     up_vector = normalize(ez - torch.dot(look_at_vector, ez) * look_at_vector)
     return up_vector, ez
