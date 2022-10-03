@@ -153,7 +153,7 @@ class BindingLoss(_Loss):
             orth_rot_loss = 0
             if self.orthogonal_rotation_weight > 0:
                 for r_mat in rotations:
-                    orth_rot_loss += abs(torch.det(r_mat) - 1) + torch.linalg.matrix_norm(r_mat.T@r_mat - torch.eye(3).to(r_mat.device))**2
+                    orth_rot_loss += abs(torch.det(r_mat) - 1) + torch.linalg.matrix_norm(r_mat.T@r_mat - torch.eye(3).to(r_mat.device))
 
             centroid_loss += self.mse_loss(ligs_coords_pred[i].mean(dim=0), ligs_coords[i].mean(dim=0))
 
