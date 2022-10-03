@@ -58,8 +58,9 @@ def find_additional_vertical_vector(vector, ez=None, device='cpu'):
     # ez = torch.FloatTensor([0, 0, 1]).to(device)
     if ez is None:
         ez = normalize(Uniform(-1,1).sample((3,)).to(device))
-        if torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-03):
-            ez = normalize(Uniform(-1,1).sample((3,)).to(device))
+
+    while torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-03):
+        ez = normalize(ez+Uniform(-1,1).sample((3,)).to(device))
 
     up_vector = normalize(ez - torch.dot(look_at_vector, ez) * look_at_vector)
     return up_vector, ez
@@ -71,26 +72,18 @@ def calc_rotation_matrix(v1_start, v2_start, v1_target, v2_target):
     M @ U = V
     M = V @ U^-1
     """
+    u1_start = normalize(v1_start)
+    u2_start = normalize(v2_start)
+    u3_start = normalize(torch.cross(u1_start, u2_start))
 
-    def get_base_matrices():
-        u1_start = normalize(v1_start)
-        u2_start = normalize(v2_start)
-        u3_start = normalize(torch.cross(u1_start, u2_start))
+    u1_target = normalize(v1_target)
+    u2_target = normalize(v2_target)
+    u3_target = normalize(torch.cross(u1_target, u2_target))
 
-        u1_target = normalize(v1_target)
-        u2_target = normalize(v2_target)
-        u3_target = normalize(torch.cross(u1_target, u2_target))
+    U = torch.hstack([u1_start.view(3, 1), u2_start.view(3, 1), u3_start.view(3, 1)])
+    V = torch.hstack([u1_target.view(3, 1), u2_target.view(3, 1), u3_target.view(3, 1)])
 
-        U = torch.hstack([u1_start.view(3, 1), u2_start.view(3, 1), u3_start.view(3, 1)])
-        V = torch.hstack([u1_target.view(3, 1), u2_target.view(3, 1), u3_target.view(3, 1)])
-
-        return U, V
-
-    def calc_base_transition_matrix(U, V):
-        return V@torch.linalg.inv(U)
-
-    U, V = get_base_matrices()
-    return calc_base_transition_matrix(U, V)
+    return V@torch.linalg.inv(U)
 
 
 def get_rotation_matrix(start_look_at_vector, target_look_at_vector, reference_vector=None, start_up_vector=None, target_up_vector=None, device='cpu'):
