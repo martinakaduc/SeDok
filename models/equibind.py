@@ -1044,7 +1044,7 @@ class EquiBind(nn.Module):
                                                    start:end].mean(dim=0), '\n')
             predicted_ligs_coords_list.append(predicted_coords)
         #torch.save({'predictions': predicted_ligs_coords_list, 'names': complex_names})
-        return predicted_ligs_coords_list, outputs[2], outputs[3], outputs[0], outputs[1], outputs[5], 0
+        return predicted_ligs_coords_list, outputs[2], outputs[3], outputs[0], outputs[1], outputs[5], 0, 0
 
     def __repr__(self):
         return "EquiBind " + str(self.__dict__)

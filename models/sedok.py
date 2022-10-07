@@ -59,7 +59,7 @@ def find_additional_vertical_vector(vector, ez=None, device='cpu'):
     if ez is None:
         ez = normalize(Uniform(-1,1).sample((3,)).to(device))
 
-    while torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=1e-2):
+    while torch.isclose(abs(look_at_vector@ez), torch.ones(1).to(device), atol=5e-3):
         ez = normalize(Uniform(-1,1).sample((3,)).to(device))
 
     up_vector = normalize(ez - torch.dot(look_at_vector, ez) * look_at_vector)
@@ -89,6 +89,7 @@ def calc_rotation_matrix(v1_start, v2_start, v1_target, v2_target):
 def get_rotation_matrix(start_look_at_vector, target_look_at_vector, reference_vector=None, start_up_vector=None, target_up_vector=None, device='cpu'):
     # if reference_vector is None:
     #     reference_vector = Uniform(-1,1).sample((3,)).to(device)
+    # EZ must be normalized
     start_ez = target_ez = torch.zeros(1).to(device)
 
     if start_up_vector is None:
@@ -98,7 +99,7 @@ def get_rotation_matrix(start_look_at_vector, target_look_at_vector, reference_v
         target_up_vector, target_ez = find_additional_vertical_vector(target_look_at_vector, ez=reference_vector, device=device)
 
     rot_mat = calc_rotation_matrix(start_look_at_vector, start_up_vector, target_look_at_vector, target_up_vector)
-    return rot_mat, abs(start_look_at_vector@start_ez.T) + abs(target_look_at_vector@target_ez.T)
+    return rot_mat, torch.exp((normalize(start_look_at_vector)@start_ez.T)**2) + torch.exp((normalize(target_look_at_vector)@target_ez.T)**2) - 2
 
 
 def get_non_lin(type, negative_slope):
@@ -174,6 +175,9 @@ def get_mask(ligand_batch_num_nodes, receptor_batch_num_nodes, device):
 def get_base_loss(base):
     u1, u2, u3 = base
     return abs(u1 @ u2.T) + abs(u2 @ u3.T) + abs(u3 @ u1.T)
+
+def get_vector_loss(vector, mean=5, std=2):
+    return 1 - torch.exp(-((torch.linalg.norm(vector) - mean)**2) /std)
 
 class CoordsNorm(nn.Module):
     def __init__(self, eps=1e-8, scale_init=1.):
@@ -1062,6 +1066,7 @@ class ISET(nn.Module):
         rotations = []
         translations = []
         base_loss = 0
+        vector_loss = []
 
         ligs_evolved = []
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
@@ -1098,6 +1103,7 @@ class ISET(nn.Module):
             rec_feats_mean = torch.mean(self.h_mean_rec(node_upd_per_receptor), dim=0, keepdim=True)  # (1, d)
             lig_centroid = torch.mean(x_evolved_per_lig, dim=0, keepdim=True)
             rec_centroid = torch.mean(x_evolved_per_rec, dim=0, keepdim=True)
+            lig_rec_distance = torch.linalg.norm(lig_centroid - rec_centroid)
 
             # attn_lig_fixed = (self.keypts_attention_lig_fixed(node_upd_per_ligand).view(-1, 1, d).transpose(0, 1) @
             #                self.keypts_queries_lig_fixed(rec_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
@@ -1114,9 +1120,8 @@ class ISET(nn.Module):
 
             if not self.lig_no_softmax:
                 attn_lig_rot = torch.softmax(attn_lig_rot, dim=1)
-
-            lig_rot_vec = attn_lig_rot @ x_evolved_per_lig - lig_centroid
-            lig_rot_vec = (lig_rot_vec.T / torch.linalg.vector_norm(lig_rot_vec, dim=1)).T
+            # else:
+            #     attn_lig_rot = torch.tanh(attn_lig_rot)
 
             attn_rec_rot = (self.keypts_attention_rec_rot(node_upd_per_receptor).view(-1, self.num_att_heads, d).transpose(0, 1) @
                             self.keypts_queries_rec_rot(lig_feats_mean).view(1, self.num_att_heads, d).transpose(0,1).transpose(1, 2) /
@@ -1124,9 +1129,13 @@ class ISET(nn.Module):
 
             if not self.rec_no_softmax:
                 attn_rec_rot = torch.softmax(attn_rec_rot, dim=1)
+            # else:
+            #     attn_rec_rot = torch.tanh(attn_rec_rot)
 
-            rec_rot_vec = rec_centroid - attn_rec_rot @ x_evolved_per_rec
-            rec_rot_vec = (rec_rot_vec.T / torch.linalg.vector_norm(rec_rot_vec, dim=1)).T
+            lig_rot_vec = attn_rec_rot @ x_evolved_per_rec - lig_centroid
+            # lig_rot_vec = (lig_rot_vec.T / torch.linalg.vector_norm(lig_rot_vec, dim=1)).T
+            rec_rot_vec = rec_centroid - attn_lig_rot @ x_evolved_per_lig
+            # rec_rot_vec = (rec_rot_vec.T / torch.linalg.vector_norm(rec_rot_vec, dim=1)).T
 
             # Ver 1
             # rotation_matrix = self.W_feature(node_upd_per_receptor) @ node_upd_per_ligand.T + \
@@ -1139,6 +1148,8 @@ class ISET(nn.Module):
                 # Ver 2: Directly
                 rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], device=self.device)
                 base_loss += b_l
+                vector_loss_cplx = get_vector_loss(lig_rot_vec[0]) + get_vector_loss(lig_rot_vec[1]) \
+                                 + get_vector_loss(rec_rot_vec[0]) + get_vector_loss(rec_rot_vec[1])
 
             elif self.locknkey == "direct_base":
                 # rotation_matrix = rec_rot_vec.T @ torch.linalg.inv(lig_rot_vec.T)
@@ -1147,6 +1158,8 @@ class ISET(nn.Module):
                 reference_vector = normalize(lig_rot_vec[1] + rec_rot_vec[1])
                 rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=reference_vector, device=self.device)
                 base_loss += b_l
+                vector_loss_cplx = get_vector_loss(lig_rot_vec[0], mean=lig_rec_distance) + get_vector_loss(lig_rot_vec[1], mean=lig_rec_distance) \
+                                 + get_vector_loss(rec_rot_vec[0], mean=lig_rec_distance) + get_vector_loss(rec_rot_vec[1], mean=lig_rec_distance)
 
                 # rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=[lig_rot_vec[1], rec_rot_vec[1]], device=self.device)
                 # base_loss += b_l
@@ -1194,8 +1207,11 @@ class ISET(nn.Module):
                 R_x[2][2] = torch.cos(gamma)
 
                 rotation_matrix = R_z @ R_y @ R_x
+                vector_loss_cplx = get_vector_loss(lig_rot_vec[0]) + get_vector_loss(rec_rot_vec[0])
+
             else:
                 rotation_matrix = torch.eye(3).to(self.device)
+                vector_loss_cplx = 0
                 
             x_evolved_per_lig = (rotation_matrix @ (x_evolved_per_lig).T).T
             # x_evolved_per_lig = (rotation_matrix @ (x_evolved_per_lig-lig_centroid).T).T + lig_centroid
@@ -1218,11 +1234,12 @@ class ISET(nn.Module):
                 log("Centroid changed?", lig_centroid - torch.mean(x_evolved_per_lig, dim=0, keepdim=True))
 
             ligs_evolved.append(x_evolved_per_lig + translation_vector)
+            vector_loss.append(vector_loss_cplx)
 
             rotations.append(rotation_matrix)
             translations.append(translation_vector)
 
-        return [rotations, translations, ligs_evolved, geom_losses, base_loss]
+        return [rotations, translations, ligs_evolved, geom_losses, base_loss, vector_loss]
 
     def __repr__(self):
         return "ISET " + str(self.__dict__)
@@ -1255,7 +1272,7 @@ class SeDok(nn.Module):
         outputs = self.iset(lig_graph, rec_graph, geometry_graph, complex_names, epoch)
         evolved_ligs = outputs[2]
         if self.evolve_only:
-            return evolved_ligs, None, None, outputs[0], outputs[1], outputs[3]
+            return evolved_ligs, None, None, outputs[0], outputs[1], outputs[3], outputs[4], outputs[5]
         ligs_node_idx = torch.cumsum(lig_graph.batch_num_nodes(), dim=0).tolist()
         ligs_node_idx.insert(0, 0)
         for idx in range(len(ligs_node_idx) - 1):
@@ -1273,7 +1290,7 @@ class SeDok(nn.Module):
                     predicted_coords.mean(dim=0) - lig_graph.ndata['x'].mean(dim=0), '\n')
             predicted_ligs_coords_list.append(predicted_coords)
         #torch.save({'predictions': predicted_ligs_coords_list, 'names': complex_names})
-        return predicted_ligs_coords_list, None, None, outputs[0], outputs[1], outputs[3], outputs[4]
+        return predicted_ligs_coords_list, None, None, outputs[0], outputs[1], outputs[3], outputs[4], outputs[5]
 
     def __repr__(self):
         return "SeDok " + str(self.__dict__)

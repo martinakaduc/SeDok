@@ -164,12 +164,17 @@ def inference(args, tune_args=None):
                 lig_graphs, rec_graphs, ligs_coords, recs_coords, all_rec_coords, pockets_coords_lig, geometry_graph, names, idx = tuple(
                     batch)
                 # if names[0] not in ['2fxs', '2iwx', '2vw5', '2wer', '2yge', ]: continue
-                ligs_coords_pred, ligs_keypts, recs_keypts, rotations, translations, geom_reg_loss = model(lig_graphs,
+                ligs_coords_pred, ligs_keypts, recs_keypts, rotations, translations, _, _, _ = model(lig_graphs,
                                                                                                            rec_graphs,
                                                                                                            complex_names=names,
                                                                                                            epoch=0,
                                                                                                            geometry_graph=geometry_graph.to(
                                                                                                                device) if geometry_graph != None else None)
+                if ligs_keypts is None:
+                    ligs_keypts = [None] * len(ligs_coords_pred)
+                if recs_keypts is None:
+                    recs_keypts = [None] * len(ligs_coords_pred)
+
                 for lig_coords_pred, lig_coords, lig_keypts, rec_keypts, rotation, translation, rec_pocket_coords in zip(
                         ligs_coords_pred, ligs_coords, ligs_keypts, recs_keypts, rotations, translations,
                         pockets_coords_lig):
@@ -205,7 +210,7 @@ def inference(args, tune_args=None):
         rmsds = np.array(rmsds)
         centroid_distsH = np.array(centroid_distsH)
 
-        print('EquiBind-U with hydrogens inclduded in the loss')
+        print('Model-U with hydrogens inclduded in the loss')
         print('mean rmsd: ', rmsds.mean().__round__(2), ' pm ', rmsds.std().__round__(2))
         print('rmsd precentiles: ', np.percentile(rmsds, [25, 50, 75]).round(2))
         print(f'rmsds below 2: {(100 * (rmsds < 2).sum() / len(rmsds)).__round__(2)}%')
@@ -217,8 +222,8 @@ def inference(args, tune_args=None):
         print(f'centroid_distances below 5: {(100 * (centroid_distsH < 5).sum() / len(centroid_distsH)).__round__(2)}%')
 
         if args.run_corrections:
-            rdkit_graphs, _ = load_graphs(
-                f'{data.processed_dir}/lig_graphs_rdkit_coords.pt')
+            # rdkit_graphs, _ = load_graphs(
+            #     f'{data.processed_dir}/lig_graphs_rdkit_coords.pt')
             kabsch_rmsds = []
             rmsds = []
             centroid_distances = []
@@ -228,12 +233,13 @@ def inference(args, tune_args=None):
             for i, (prediction, target, lig_keypts, rec_keypts, name) in tqdm(enumerate(
                     zip(results['predictions'], results['targets'], results['lig_keypts'], results['rec_keypts'],
                         results['names']))):
+                rdkit_graph, _ = load_graphs(f'{data.processed_dir}/lig_graphs_rdkit_coords.pt/{name}.pt')
                 lig = read_molecule(os.path.join('data/PDBBind/', name, f'{name}_ligand.sdf'), sanitize=True)
                 if lig == None:  # read mol2 file if sdf file cannot be sanitized
                     lig = read_molecule(os.path.join('data/PDBBind/', name, f'{name}_ligand.mol2'), sanitize=True)
 
                 lig_rdkit = deepcopy(lig)
-                rdkit_coords = rdkit_graphs[i].ndata['new_x'].numpy()
+                rdkit_coords = rdkit_graph[0].ndata['new_x'].numpy()
                 conf = lig_rdkit.GetConformer()
                 for i in range(lig_rdkit.GetNumAtoms()):
                     x, y, z = rdkit_coords[i]
@@ -285,7 +291,7 @@ def inference(args, tune_args=None):
             kabsch_rmsds_optimized = np.array(kabsch_rmsds_optimized)
             rmsd_optimized = np.array(rmsds_optimized)
             centroid_dists = np.array(centroid_distances_optimized)
-            print('EquiBind-U')
+            print('Model-U')
             print('mean rmsdval: ', rmsdvals.mean().__round__(2), ' pm ', rmsdvals.std().__round__(2))
             print('rmsd precentiles: ', np.percentile(rmsdvals, [25, 50, 75]).round(2))
             print(f'rmsdvals below 2: {(100 * (rmsdvals < 2).sum() / len(rmsdvals)).__round__(2)}%')
@@ -297,7 +303,7 @@ def inference(args, tune_args=None):
             print(f'mean kabsch RMSD: ', kabsch_rmsds.mean().__round__(2), ' pm ', kabsch_rmsds.std().__round__(2))
             print('kabsch RMSD percentiles: ', np.percentile(kabsch_rmsds, [25, 50, 75]).round(2))
 
-            print('EquiBind')
+            print('Model+FPCLF')
             print('mean rmsdval: ', rmsd_optimized.mean().__round__(2), ' pm ', rmsd_optimized.std().__round__(2))
             print('rmsd precentiles: ', np.percentile(rmsd_optimized, [25, 50, 75]).round(2))
             print(f'rmsdvals below 2: {(100 * (rmsd_optimized < 2).sum() / len(rmsd_optimized)).__round__(2)}%')

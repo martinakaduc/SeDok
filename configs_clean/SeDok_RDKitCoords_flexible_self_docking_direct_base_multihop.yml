@@ -14,14 +14,15 @@ loss_func: BindingLoss
 loss_params:
   ot_loss_weight: 0
   key_point_alignmen_loss_weight: 0 # this does only work if ot_loss_weight is not 0
-  centroid_loss_weight: 1
+  centroid_loss_weight: 0
   intersection_loss_weight: 1
   intersection_sigma: 8 # 8 was determined by gridsearch over data
   intersection_surface_ct: 1 # grid search says 2.5
   translated_lig_kpt_ot_loss: False
   kabsch_rmsd_weight: 0
-  orthogonal_rotation_weight: 1
+  orthogonal_rotation_weight: 0
   base_loss_weight: 1
+  vector_loss_weight: 0
 
 
 train_names: 'data/timesplit_no_lig_overlap_train'

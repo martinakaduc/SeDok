@@ -1,5 +1,5 @@
 run_dirs:
-  - flexible_self_docking # the resulting coordinates will be saved here as tensors in a .pt file (but also as .sdf files if you specify an "output_directory" below)
+  - SeDok_flexible_self_docking # the resulting coordinates will be saved here as tensors in a .pt file (but also as .sdf files if you specify an "output_directory" below)
 inference_path: # 'data/your_input_path' # this should be your input file path as described in the main readme
 
 test_names: data/timesplit_test
