@@ -4,7 +4,7 @@ data_seed: 1
 
 trainer: binding
 num_epochs: 1000000
-batch_size: 64
+batch_size: 8
 log_iterations: 100
 patience: 150
 num_train:  # leave empty to use all (in param train_names below)
@@ -107,7 +107,7 @@ model_parameters:
   move_keypts_back: True # move the constructed keypoints back to the location of the ligand
   normalize_Z_rec_directions: False
   normalize_Z_lig_directions: False
-  n_lays: 4  # 5 in  good run
+  n_lays: 8  # 5 in  good run
   debug: False
   use_rec_atoms: False 
   shared_layers: False # False in good run
@@ -117,7 +117,7 @@ model_parameters:
   use_mean_node_features: True
   residue_emb_dim: 64
   lay_hid_dim: 64
-  multihop_strategy: [1, 2, 3, 4]
+  multihop_strategy: [1, 1, 1, 2, 2, 2, 3, 3]
   locknkey: "direct_base"
   num_att_heads: 0
   dropout: 0.1

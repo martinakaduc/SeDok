@@ -176,8 +176,8 @@ def get_base_loss(base):
     u1, u2, u3 = base
     return abs(u1 @ u2.T) + abs(u2 @ u3.T) + abs(u3 @ u1.T)
 
-def get_vector_loss(vector, mean=5, std=2):
-    return 1 - torch.exp(-((torch.linalg.norm(vector) - mean)**2) /std)
+def get_vector_loss(vectors, mean=5, std=2):
+    return torch.sum(1 - torch.exp(-((torch.linalg.vector_norm(vectors, dim=1) - mean)**2) /std))
 
 class CoordsNorm(nn.Module):
     def __init__(self, eps=1e-8, scale_init=1.):
@@ -343,7 +343,7 @@ class ISET_Layer(nn.Module):
         )
         if self.standard_norm_order:
             self.node_mlp_lig = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + out_feats_dim, h_feats_dim),
                 get_layer_norm(layer_norm, h_feats_dim),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Dropout(dropout),
@@ -352,7 +352,7 @@ class ISET_Layer(nn.Module):
             )
         else:
             self.node_mlp_lig = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + out_feats_dim, h_feats_dim),
                 nn.Dropout(dropout),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 get_layer_norm(layer_norm, h_feats_dim),
@@ -360,7 +360,7 @@ class ISET_Layer(nn.Module):
             )
         if self.standard_norm_order:
             self.node_mlp = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + out_feats_dim, h_feats_dim),
                 get_layer_norm(layer_norm, h_feats_dim),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 nn.Dropout(dropout),
@@ -369,7 +369,7 @@ class ISET_Layer(nn.Module):
             )
         else:
             self.node_mlp = nn.Sequential(
-                nn.Linear(orig_h_feats_dim + h_feats_dim + out_feats_dim, h_feats_dim),
+                nn.Linear(orig_h_feats_dim + 2 * h_feats_dim + out_feats_dim, h_feats_dim),
                 nn.Dropout(dropout),
                 get_non_lin(nonlin, leakyrelu_neg_slope),
                 get_layer_norm(layer_norm, h_feats_dim),
@@ -658,11 +658,13 @@ class ISET_Layer(nn.Module):
                         'data[x_update] : \sum_j (x_i - x_j) * \phi^x(m_{i->j})')
                     log(torch.max(x_evolved_lig.abs()), 'x_i new = x_evolved_lig : x_i + data[x_update]')
 
-            input_node_upd_ligand = torch.cat((lig_graph.ndata['aggr_msg'],
+            input_node_upd_ligand = torch.cat((self.node_norm(lig_graph.ndata['feat']),
+                                               lig_graph.ndata['aggr_msg'],
                                                cross_attention_lig_feat,
                                                original_ligand_node_features), dim=-1)
 
-            input_node_upd_receptor = torch.cat((rec_graph.ndata['aggr_msg'],
+            input_node_upd_receptor = torch.cat((self.node_norm(rec_graph.ndata['feat']),
+                                                 rec_graph.ndata['aggr_msg'],
                                                  cross_attention_rec_feat,
                                                  original_receptor_node_features), dim=-1)
 
@@ -1082,6 +1084,8 @@ class ISET(nn.Module):
                 ligs_evolved.append(Z_lig_coords)
             return [rotations, translations, ligs_evolved, geom_losses]
 
+        max_scale_radius = (torch.exp(torch.tensor(1)) - torch.tensor(1)).to(self.device)
+
         for idx in range(len(ligs_node_idx) - 1):
             lig_start = ligs_node_idx[idx]
             lig_end = ligs_node_idx[idx + 1]
@@ -1103,7 +1107,9 @@ class ISET(nn.Module):
             rec_feats_mean = torch.mean(self.h_mean_rec(node_upd_per_receptor), dim=0, keepdim=True)  # (1, d)
             lig_centroid = torch.mean(x_evolved_per_lig, dim=0, keepdim=True)
             rec_centroid = torch.mean(x_evolved_per_rec, dim=0, keepdim=True)
-            lig_rec_distance = torch.linalg.norm(lig_centroid - rec_centroid)
+            # lig_rec_distance = torch.linalg.norm(lig_centroid - rec_centroid)
+            lig_max_radius = max_scale_radius * torch.max(torch.linalg.vector_norm(x_evolved_per_lig - lig_centroid, dim=1))
+            rec_max_radius = max_scale_radius * torch.max(torch.linalg.vector_norm(x_evolved_per_rec - rec_centroid, dim=1))
 
             # attn_lig_fixed = (self.keypts_attention_lig_fixed(node_upd_per_ligand).view(-1, 1, d).transpose(0, 1) @
             #                self.keypts_queries_lig_fixed(rec_feats_mean).view(1, 1, d).transpose(0,1).transpose(1, 2) /
@@ -1119,7 +1125,7 @@ class ISET(nn.Module):
                             math.sqrt(d)).view(self.num_att_heads, -1)
 
             if not self.lig_no_softmax:
-                attn_lig_rot = torch.softmax(attn_lig_rot, dim=1)
+                attn_lig_rot = torch.exp(torch.softmax(attn_lig_rot, dim=1))
             # else:
             #     attn_lig_rot = torch.tanh(attn_lig_rot)
 
@@ -1128,13 +1134,13 @@ class ISET(nn.Module):
                             math.sqrt(d)).view(self.num_att_heads, -1)
 
             if not self.rec_no_softmax:
-                attn_rec_rot = torch.softmax(attn_rec_rot, dim=1)
+                attn_rec_rot = torch.exp(torch.softmax(attn_rec_rot, dim=1))
             # else:
             #     attn_rec_rot = torch.tanh(attn_rec_rot)
 
-            lig_rot_vec = attn_rec_rot @ x_evolved_per_rec - lig_centroid
+            lig_rot_vec = attn_lig_rot @ x_evolved_per_lig - lig_centroid
             # lig_rot_vec = (lig_rot_vec.T / torch.linalg.vector_norm(lig_rot_vec, dim=1)).T
-            rec_rot_vec = rec_centroid - attn_lig_rot @ x_evolved_per_lig
+            rec_rot_vec = rec_centroid - attn_rec_rot @ x_evolved_per_rec
             # rec_rot_vec = (rec_rot_vec.T / torch.linalg.vector_norm(rec_rot_vec, dim=1)).T
 
             # Ver 1
@@ -1148,8 +1154,7 @@ class ISET(nn.Module):
                 # Ver 2: Directly
                 rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], device=self.device)
                 base_loss += b_l
-                vector_loss_cplx = get_vector_loss(lig_rot_vec[0]) + get_vector_loss(lig_rot_vec[1]) \
-                                 + get_vector_loss(rec_rot_vec[0]) + get_vector_loss(rec_rot_vec[1])
+                # vector_loss_cplx = get_vector_loss(lig_rot_vec, mean=lig_max_radius) + get_vector_loss(rec_rot_vec, mean=rec_max_radius) 
 
             elif self.locknkey == "direct_base":
                 # rotation_matrix = rec_rot_vec.T @ torch.linalg.inv(lig_rot_vec.T)
@@ -1158,8 +1163,7 @@ class ISET(nn.Module):
                 reference_vector = normalize(lig_rot_vec[1] + rec_rot_vec[1])
                 rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=reference_vector, device=self.device)
                 base_loss += b_l
-                vector_loss_cplx = get_vector_loss(lig_rot_vec[0], mean=lig_rec_distance) + get_vector_loss(lig_rot_vec[1], mean=lig_rec_distance) \
-                                 + get_vector_loss(rec_rot_vec[0], mean=lig_rec_distance) + get_vector_loss(rec_rot_vec[1], mean=lig_rec_distance)
+                vector_loss_cplx = get_vector_loss(lig_rot_vec, mean=lig_max_radius) + get_vector_loss(rec_rot_vec, mean=rec_max_radius) 
 
                 # rotation_matrix, b_l = get_rotation_matrix(lig_rot_vec[0], rec_rot_vec[0], reference_vector=[lig_rot_vec[1], rec_rot_vec[1]], device=self.device)
                 # base_loss += b_l
@@ -1225,7 +1229,7 @@ class ISET(nn.Module):
 
             predicted_lig_centroid = att_weights_rec_trans @ x_evolved_per_rec
             translation_vector = predicted_lig_centroid - torch.mean(x_evolved_per_lig, dim=0, keepdim=True)
-            
+
             if self.debug:
                 log('rotation', rotation_matrix)
                 log('rotation @ rotation.t() - eye(3)', rotation_matrix @ rotation_matrix.T - torch.eye(3).to(self.device))

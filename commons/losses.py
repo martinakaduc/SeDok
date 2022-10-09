@@ -173,7 +173,7 @@ class BindingLoss(_Loss):
             geom_reg_loss = geom_reg_loss / float(len(ligs_coords_pred))
             base_loss = base_loss / float(len(ligs_coords_pred))
             orth_rot_loss = orth_rot_loss / float(len(rotations))# / float(len(rotations[0]))
-            vector_loss = torch.sum(torch.tensor(vector_losses)) / float(len(vector_losses))
+            vector_loss = torch.sum(torch.tensor(vector_losses)) / float(len(ligs_coords_pred))
 
         loss = ligs_coords_loss + self.ot_loss_weight * ot_loss + \
                self.intersection_loss_weight * intersection_loss + \
