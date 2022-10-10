@@ -22,7 +22,7 @@ loss_params:
   kabsch_rmsd_weight: 0
   orthogonal_rotation_weight: 0
   base_loss_weight: 1
-  vector_loss_weight: 0
+  vector_loss_weight: 1
 
 
 train_names: 'data/timesplit_no_lig_overlap_train'
